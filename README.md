@@ -1,3 +1,6 @@
+[![Repo](https://img.shields.io/badge/app-Python%20Shiny-blue)](#)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
 # US Stock Market Data Pipeline (yfinance + SEC EDGAR)
 
 This project is a comprehensive Python pipeline for downloading, cleaning, and enriching daily stock market data for all US-listed (NASDAQ & NYSE) common stocks.
