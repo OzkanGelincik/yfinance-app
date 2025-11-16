@@ -10,7 +10,8 @@
 - **`app.py`** — a Shiny for Python app with three tools: **Portfolio Backtester**, **Sector Explorer**, and **Event Study**.
 
 All generated data lives in **`outputs/`** (ignored by Git).
-Deployed app: **https://ozkangelincikshinyapps.io/yfinance-app1/**
+
+**Deployed app: https://ozkangelincikshinyapp.shinyapps.io/yfinance-app1/**
 
 ---
 
