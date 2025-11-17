@@ -31,6 +31,10 @@ from shiny.ui import tags
 # Folder where this app.py lives (robust to "current working directory" issues) 
 APP_DIR = Path(__file__).resolve().parent
 
+OUT_DIR = APP_DIR / "outputs"
+
+SEC_CSV = OUT_DIR / "sec_filing_descriptions.csv"
+
 # Accept any of these filenames; first one found wins.
 CANDIDATES = [
     "sample.parquet", # allow a tiny demo file
@@ -316,7 +320,7 @@ I’m Ozkan Gelincik—cancer-research operations leader turned data scientist. 
 Use the buttons above (LinkedIn, GitHub, ResearchGate, Google Scholar).  
 
 #### **Acknowledgments**
-*Grateful to the NYC Data Science Academy community—especially Vinod Chugani, Jonathan Harris, Joe Lu, David Wasserman, and Luke Lin—for thoughtful, actionable feedback. Thanks also to the open-source maintainers and data providers—`yfinance`, `yahoo_fin`, `yahooquery`, and SEC EDGAR—that made this project possible.*
+*Grateful to the NYC Data Science Academy community—especially Vinod Chugani, Jonathan Harris, Joe Lu, David Wasserman, and Andrew Dodd—for thoughtful, actionable feedback. Thanks also to the open-source maintainers and data providers—`yfinance`, `yahoo_fin`, `yahooquery`, and SEC EDGAR—that made this project possible.*
 """
 
 # Define the markdown content for "Dataset Build" as a string
@@ -575,7 +579,7 @@ app_ui = ui.page_fluid(
                     ui.input_selectize("p_tickers", "Pick tickers (1–10)", ticker_choices, multiple=True),
                     ui.input_numeric("p_cash", "Initial cash ($)", value=10_000, min=100),
                     ui.input_checkbox("p_equal", "Equal-weight portfolio?", value=True),
-                    ui.input_date_range("p_dater", "Backtest range (9/30/2024-9/30/2025)", start=dlo, end=dhi),
+                    ui.input_date_range("p_dater", "Backtest range (Data available: 9/30/2024-9/30/2025)", start=dlo, end=dhi),
                     ui.input_action_button("p_go", "Simulate"),
                     ui.hr(),
                     ui.help_text("Uses simple returns derived from log returns. Buy once and hold; equal-weight at start if checked and inverse-price static weight if unchecked."),
@@ -598,7 +602,7 @@ app_ui = ui.page_fluid(
                 ui.sidebar(
                     ui.input_checkbox_group("s_sectors", "Sectors", sector_choices, inline=False),
                     ui.input_checkbox("s_equal", "Equal-weight within sector", value=True),
-                    ui.input_date_range("s_dater", "Backtest range (9/30/2024-9/30/2025)", start=dlo, end=dhi),
+                    ui.input_date_range("s_dater", "Backtest range (Data available: 9/30/2024-9/30/2025)", start=dlo, end=dhi),
                     ui.input_action_button("s_go", "Build sector indices"),
                     ui.hr(),
                     ui.help_text("'Equal-weight within sector' feature is in beta. Currently, it calculates cumulative returns with equal-weights given to each ticker. Future interations will add an alternative weighting strategy when unchecked."),
@@ -625,7 +629,7 @@ app_ui = ui.page_fluid(
                     ui.sidebar(
                         ui.input_selectize("etype", "Event type(s)", event_types, multiple=True, selected=event_types[:1] if event_types else []),
                         ui.input_slider("k", "Event window (trading days)", min=1, max=20, value=5),
-                        ui.input_date_range("dater", "Event date range (9/30/2024-9/30/2025)", start=dlo, end=dhi),
+                        ui.input_date_range("dater", "Event date range (Data available: 9/30/2024-9/30/2025)", start=dlo, end=dhi),
                         ui.input_checkbox_group("sector", "Sectors", sector_choices, inline=True),
                         ui.input_checkbox("no_overlap", "Exclude overlapping days (co-occurring events)", value=False),
                         ui.input_action_button("go", "Run"),
@@ -647,7 +651,7 @@ app_ui = ui.page_fluid(
                     ui.sidebar(
                         ui.input_selectize("ind_etype", "Event type(s)", event_types, multiple=True, selected=event_types[:1] if event_types else []),
                         ui.input_slider("ind_k", "Event window (trading days)", min=1, max=20, value=5),
-                        ui.input_date_range("ind_dater", "Event date range (9/30/2024-9/30/2025)", start=dlo, end=dhi),
+                        ui.input_date_range("ind_dater", "Event date range (Data available: 9/30/2024-9/30/2025)", start=dlo, end=dhi),
                         ui.input_selectize("ind_tickers", "Pick tickers (1–10)", ticker_choices, multiple=True),
                         ui.input_action_button("ind_go", "Run"),
                         ui.hr(),
@@ -1236,7 +1240,7 @@ def server(input, output, session):
     @output
     @render.table
     def sec_desc_tbl():
-        df = pd.read_csv("outputs/sec_filing_descriptions.csv")
+        df = pd.read_csv(SEC_CSV)
         return df
 
 # Bundle UI + server into a Shiny app
