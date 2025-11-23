@@ -35,12 +35,12 @@ OUT_DIR = APP_DIR / "outputs"
 
 SEC_CSV = OUT_DIR / "sec_filing_descriptions.csv"
 
+www_dir = Path(__file__).parent / "www"
+
 # Accept any of these filenames; first one found wins.
 CANDIDATES = [
-    "sample.parquet", # allow a tiny demo file
-    "analysis_enriched.parquet",
-    "analysis_enriched_with_filings.parquet",
-    "analysis_enriched_with_splits.parquet"
+    "sample_backfilled_v7_1y_9col.parquet", # allow a tiny demo file
+    "analysis_enriched_backfilled_v7.parquet",
 ]
 
 # Find the first candidate that exists under outputs/
@@ -55,10 +55,27 @@ if DATA_PQ is None:
         f"Could not find any of {CANDIDATES} in {APP_DIR/'outputs'}"
     )
 
-# Load the dataset once into memory (Parquet is fast & preserves dtypes)
-AE = pd.read_parquet(DATA_PQ)
+# 1) DEFINE ONLY THE COLUMNS WE NEED
+# This prevents loading 'open', 'high', 'low', 'volume', 'cik', etc. into RAM
+cols_to_keep = [
+    "date", "ticker", "close", "logret", "sector", 
+    "filing_form", "is_split_day", "is_reverse_split_day"
+]
+
+# 2) LOAD DATA WITH OPTIMIZATIONS
+AE = pd.read_parquet(DATA_PQ, columns=cols_to_keep)
 
 # print(AE.sample(50))
+
+# 3) OPTIMIZE MEMORY USAGE IMMEDIATELY
+# Convert 'ticker' and 'sector' to category.
+# (Strings take huge RAM; Categories map strings to tiny integers)
+AE["ticker"] = AE["ticker"].astype("category")
+AE["sector"] = AE["sector"].astype("category")
+
+# Downcast floats to float32 (halves memory usage for numbers)
+f_cols = AE.select_dtypes(include=['float64']).columns
+AE[f_cols] = AE[f_cols].astype("float32")
 
 # ── Normalize core columns (prevents a lot of downstream headaches) ─────────
 # 1) date → pandas datetime (NaT on bad values), drop timezone, keep only the day
@@ -68,10 +85,16 @@ AE["date"] = (
       .dt.normalize()
 )
 
-# 2) ticker → uppercase strings (consistent joins/filters)
-AE["ticker"] = AE["ticker"].astype(str).str.upper()
+# 2) ticker → Ensure consistency (Category handles this better, but if you need uppercase string logic:)
+# Note: Since we used category above, we verify they are upper. 
+# If your parquet tickers are already uppercase, you can skip this.
+# If you must force upper, do it before converting to category to save RAM:
+# (Here we assume they are reasonably clean, or we process them as categories)
 
-# 3) Sort for deterministic cumulative operations, tidy up index
+# 2) ticker → uppercase strings (consistent joins/filters)
+# AE["ticker"] = AE["ticker"].astype(str).str.upper()
+
+# 3) Sort (Sorting is expensive! doing it after dropping columns is faster)
 AE = AE.sort_values(["ticker", "date"]).reset_index(drop=True)
 
 # 4) Trading-day index per ticker:
@@ -86,6 +109,7 @@ if "logret" not in AE.columns and "close" in AE.columns:
         AE.groupby("ticker")["close"]
           .apply(lambda s: np.log(s / s.shift(1)))
           .reset_index(level=0, drop=True)
+          .astype("float32") # Keep it small
     )
 
 # NOTE: Deprecated helper. Event Study now uses the long EVENTS table
@@ -204,90 +228,116 @@ dlo, dhi = _dater_default(AE, 252)
 # Each ui.input_* creates a reactive input accessible via `input.<id>()` in server.
 
 head_links = ui.head_content(
-
-        # MathJax config MUST come before the loader script
+    # (Optional) helper to jump to a tab by label text
     ui.tags.script("""
-    window.MathJax = {
-        tex: {
-        inlineMath: [['$', '$'], ['\\\\(', '\\\\)']],
-        displayMath: [['$$','$$'], ['\\\\[','\\\\]']],
-        processEscapes: true
-        },       
-        options: { processHtmlClass: 'mjx' },   // only typeset elements you mark
-        chtml: { matchFontHeight: false }       // keep a consistent font size
-    };
-    """),
-    ui.tags.script(
-    src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js",
-    id="MathJax-script",
-    **{"defer": True}
-    ),
-    # …your other links/styles/scripts…
-
-    # optional: re-typeset when DOM updates
-    ui.tags.script("""
-      (function(){
-        let pending=false;
-        const rerender=()=>{ if(window.MathJax){ MathJax.typesetPromise(); } pending=false; };
-        const obs=new MutationObserver(()=>{ if(!pending){ pending=true; requestAnimationFrame(rerender); }});
-        obs.observe(document.body,{childList:true,subtree:true});
-      })();
-    """),
-
-    ui.tags.script("""
-    window.goToTabByText = function(txt){
+      window.goToTabByText = function(txt){
         var links = document.querySelectorAll('.nav-link');
         for (const a of links) {
-        if ((a.textContent || a.innerText).trim() === txt) { a.click(); return true; }
+          if ((a.textContent || a.innerText).trim() === txt) { a.click(); return true; }
         }
         return false;
-    };
+      };
     """),
 
-    # Font Awesome
-    ui.tags.link(
-        rel="stylesheet",
-        href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css",
-        crossorigin="anonymous", referrerpolicy="no-referrer",
-    ),
-    # Academicons
-    ui.tags.link(
-        rel="stylesheet",
-        href="https://cdnjs.cloudflare.com/ajax/libs/academicons/1.9.4/css/academicons.min.css",
-        crossorigin="anonymous", referrerpolicy="no-referrer",
-    ),
+    # Icons (keep if used)
+    ui.tags.link(rel="stylesheet",
+      href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css",
+      crossorigin="anonymous", referrerpolicy="no-referrer"),
+    ui.tags.link(rel="stylesheet",
+      href="https://cdnjs.cloudflare.com/ajax/libs/academicons/1.9.4/css/academicons.min.css",
+      crossorigin="anonymous", referrerpolicy="no-referrer"),
 
-    # Minimal CSS
-    ui.tags.style("""
-      .about-badges .badge { font-weight:600; padding:.45rem .75rem; }
-      .about-badges .pill-nycdsa { background:#ffb3ba; color:#000; }
-      .about-badges .pill-cornell { background:#ffffba; color:#000; }
-      .about-badges .pill-ops { background:#b3ebf2; color:#000; }
+    # Global styles
+    ui.tags.style(
+        """          
+        .about-badges .badge { font-weight:600; padding:.45rem .75rem; }
+        .about-badges .pill-nycdsa { background:#ffb3ba; color:#000; }
+        .about-badges .pill-cornell { background:#ffffba; color:#000; }
+        .about-badges .pill-ops { background:#b3ebf2; color:#000; }
 
-      /* square icon buttons */
-      .btn-icon { display:inline-flex; align-items:center; justify-content:center;
+        .btn-icon { display:inline-flex; align-items:center; justify-content:center;
                   width:40px; height:40px; padding:0; border-radius:.5rem; }
-      .btn-icon i { line-height:1; font-size:1.15rem; }
+        .btn-icon i { line-height:1; font-size:1.15rem; }
 
-      .about-left  { padding-right:1rem; }
-      .about-right { padding-left:1rem; }
-      @media (min-width: 992px) {
+        .about-left  { padding-right:1rem; }
+        .about-right { padding-left:1rem; }
+        @media (min-width: 992px) {
         .about-left  { padding-right:1.25rem; border-right:1px solid #eee; }
         .about-right { padding-left:1.25rem; }
-      }
+        }
+
+        /* Appendix/plain-math helpers */
+        .nowrap { white-space: nowrap; }
+
+        /* Optional video styles */
+        .about-video{
+        width:50%; height:auto; display:block;
+        margin:.5rem 0 1.25rem; border:1px solid #e9ecef;
+        border-radius:.75rem; box-shadow:0 1px 2px rgba(0,0,0,.06);
+        }
+        .video-caption{ margin-top:-.5rem; margin-bottom:1rem; color:#6c757d; font-size:.9rem; }
+                  
+        /* Padding prevents first-child margin collapse */
+        .about, .appendix { padding-top: .25rem; }
+
+        /* Add vertical breathing room before headings */
+        .about h2, .about h3, .about h4, .about h5, .about h6,
+        .appendix h2, .appendix h3, .appendix h4, .appendix h5, .appendix h6 {
+        margin-top: 1.25rem !important;   /* adjust as you like */
+        margin-bottom: 0.5rem !important;
+        }
+
+        /* Don’t over-space the very first heading inside each panel */
+        .about h2:first-of-type, .about h3:first-of-type, .about h4:first-of-type, .about h5:first-of-type, .about h6:first-of-type,
+        .appendix h2:first-of-type, .appendix h3:first-of-type, .appendix h4:first-of-type, .appendix h5:first-of-type, .appendix h6:first-of-type {
+        margin-top: 0.25rem !important;
+        }
     """),
 )
 
 
 # Define the markdown content for "About" as a string
 about_markdown = r"""
-#### **About the Author**  
-I’m Ozkan Gelincik—cancer-research operations leader turned data scientist. After 10+ years at Weill Cornell Medicine advancing cancer-prevention research and publishing in top-tier medical journals, I now build end-to-end data pipelines, machine-learning models, and interactive visualizations that turn messy data into clear, actionable decisions.
+## **What this app does**
+**1)** **Portfolio Simulator — build & backtest portfolios**
 
-#### **What this app does**
-- **Portfolio Simulator:** Build a simple buy-and-hold backtest for your tickers with either equal or inverse-price starting weights—no rebalancing.
-- **Sector Explorer:** Compare sectors on indexed lines (base = 1), with equal-weight members and rolling returns to spot momentum and drawdowns.
-- **Event Study:** Align returns around event dates (e.g., news, earnings, SEC filings) and compute (cumulative) average return (AR/CAR) with expected return = 0 to see event-day (i.e., day-0) reactions.
+Simulates a buy-and-hold portfolio from your chosen tickers with equal-weight (default) or inverse-price starting weights; customizable date range and starting cash.
+
+<div>
+  <video class="about-video" controls preload="metadata" playsinline poster="portfolio_simulator_poster.png">
+    <source src="https://yfinance-app-videos.s3.amazonaws.com/portfolio_simulator_demo.mp4" type="video/mp4">
+    Your browser doesn’t support HTML5 video. You can
+    <a href="https://yfinance-app-videos.s3.amazonaws.com/portfolio_simulator_demo.mp4" download>download the demo</a>.
+  </video>
+  <div class="video-caption">Quick tour of the Portfolio Simulator workflow.</div>
+</div>
+
+**2)** **Sector Explorer — build indexed sector lines**
+
+Builds equal-weight (per day) sector return series from constituents and cumulates them to indices that start at 1.
+
+<div>
+  <video class="about-video" controls preload="metadata" playsinline poster="sector_explorer_poster.png">
+    <source src="https://yfinance-app-videos.s3.amazonaws.com/sector_explorer_demo.mp4" type="video/mp4">
+    Your browser doesn’t support HTML5 video. You can
+    <a href="https://yfinance-app-videos.s3.amazonaws.com/sector_explorer_demo.mp4" download>download the demo</a>.
+  </video>
+  <div class="video-caption">From daily sector averages to cumulative indices.</div>
+</div>
+
+**3)** **Event Study — average (cumulative) log returns around events**
+
+Select filing/split types, a window (±k trading days), and optional sector filters; view average CAR with a 95% CI.
+
+<div>
+  <video class="about-video" controls preload="metadata" playsinline poster="event_study_poster.png">
+    <source src="https://yfinance-app-videos.s3.amazonaws.com/event_study_demo.mp4" type="video/mp4">
+    Your browser doesn’t support HTML5 video. You can
+    <a href="https://yfinance-app-videos.s3.amazonaws.com/event_study_demo.mp4" download>download the demo</a>.
+  </video>
+  <div class="video-caption">Event selection → windows → CAR chart & export.</div>
+</div>
+
 
 <span>
   <a href="#tab-Appendix"
@@ -298,29 +348,24 @@ I’m Ozkan Gelincik—cancer-research operations leader turned data scientist. 
 </span>
 <div class="mt-3"></div>
 
-#### **Tech stack**  
-- **Python Shiny (UI)**
+## **Tech stack** - **Python Shiny (UI)**
   - pandas, NumPy (wrangling & returns)  
   - Plotly (interactive charts)
-- **Data sources**  
-  - Yahoo Finance via 
+- **Data sources** - Yahoo Finance via 
     - `yfinance` (OHLCV, adj close)  
     - `yahoo_fin` (NASDAQ/NYSE ticker lists)
     - `yahooquery` (market cap, sector, industry)  
   - SEC EDGAR API (submissions + companyfacts JSON (`/api/xbrl/companyfacts/CIK{cik}.json`) via `requests`) for CIK/SIC, filings, shares/public float
-- **Caching/IO**  
-  - Parquet for fast reloads; local JSON cache for SEC responses; CSV export from the app. *No DuckDB used.*
+- **Caching/IO** - Parquet for fast reloads; local JSON cache for SEC responses; CSV export from the app. *No DuckDB used.*
 
-#### **Data & caveats**  
-• Educational use only — **not financial advice**.  
+## **Data & caveats** • Educational use only — **not financial advice**.  
 • Market data may be delayed and subject to API limits.  
 • Results are demo estimates; verify independently.
 
-#### **Contact**  
-Use the buttons above (LinkedIn, GitHub, ResearchGate, Google Scholar).  
+## **Contact** Use the buttons above (LinkedIn, GitHub, ResearchGate, Google Scholar).  
 
-#### **Acknowledgments**
-*Grateful to the NYC Data Science Academy community—especially Vinod Chugani, Jonathan Harris, Joe Lu, David Wasserman, and Andrew Dodd—for thoughtful, actionable feedback. Thanks also to the open-source maintainers and data providers—`yfinance`, `yahoo_fin`, `yahooquery`, and SEC EDGAR—that made this project possible.*
+## **Acknowledgments**
+*Grateful to the NYC Data Science Academy community—especially Vinod Chugani, Jonathan Harris, Joe Lu, David Wasserman, Andrew Dodd, and Luke Lin—for thoughtful, actionable feedback. Thanks also to the open-source maintainers and data providers—`yfinance`, `yahoo_fin`, `yahooquery`, and SEC EDGAR—that made this project possible.*
 """
 
 # Define the markdown content for "Dataset Build" as a string
@@ -393,13 +438,19 @@ This is the most critical step. All data sources are merged into the daily price
     pd.merge_asof(daily_panel, filings, direction='backward', ...)
     ```
 
-#### **Step 8: Save Meta Dataset**
-The final, fully assembled 3.8M+ row DataFrame is saved as `analysis_enriched.csv` (for compatibility) and `analysis_enriched.parquet` (for speed and type preservation).
-* **Meta Files:** `analysis_enriched.csv`, `analysis_enriched.parquet`
-* **Meta Data Content:** 31 columns (see dictionary) for 5,120+ tickers, typically from 2022-10-03 to 2025-09-30 (3 years).
+#### **Step 8: Save Meta Dataset (v4 - Market Cap Fixed)**
+The final, fully assembled DataFrame is saved. This version (`v4`) successfully backfilled `sector` to 100% and `market_cap` to ~60% by calculating it daily (`adj_close * shares_outstanding`).
+* **Note on v5:** An attempt was made to backfill missing `volume` data using `yf.download()`, but it was skipped due to IP rate-limiting blocks. We proceeded to v6 instead.
+* **Meta Files:** `analysis_enriched_backfilled_v4.parquet`
+* **Meta Data Content:** 31 columns (see dictionary) for 5,120+ tickers.
 
-#### **Step 9: Subset Data for Shiny App**
-The final dataset used in this app is a lightweight subset of the meta file. It is a 1.2M+ row DataFrame saved as `sample.parquet` with only the columns needed for the app: `date`, `ticker`, `close`, `logret`, `filing_form`, `sector`, `is_split_day`, `is_reverse_split_day`, and `market_cap`. For practical reasons, only the last year of data (approx. 2024-10-01 to 2025-09-30) was kept.
+#### **Step 9: Step 9: Add Missing ETFs (v6) & Validate Volumes (v7)**
+We identified that 77 of the top 100 ETFs were missing. We successfully downloaded their full history and appended them (`v6`). We then ran a validation pass on the ~1,779 tickers with missing volumes, confirming they are delisted/dead (`v7`).
+* **Final Master File:** `analysis_enriched_backfilled_v7.parquet`
+* **Key Stats:** 100% Sector Coverage, 100% Top ETF Coverage, Validated "True Negative" missing data.
+
+#### **Step 10: Subset Data for Shiny App**
+The final dataset used in this app is a lightweight subset of the meta file `v7`. It is a 1.2M+ row DataFrame saved as `sample.parquet` with only the columns needed for the app: `date`, `ticker`, `close`, `logret`, `filing_form`, `sector`, `is_split_day`, `is_reverse_split_day`, and `market_cap`. For practical reasons, only the last year of data (approx. 2024-09-30 to 2025-09-30) was kept.
 * **Final File:** `sample.parquet`
 
 ---
@@ -440,21 +491,21 @@ The final dataset used in this app is a lightweight subset of the meta file. It 
 """
 
 appendix_markdown = r"""
-#### **About this app**  
+## **About this app**  
 An interactive toolkit with three workflows—Portfolio Simulator (buy-and-hold with Equal or Inverse-price weights), Sector Explorer (indexed sector lines with equal-weight members and rolling stats), and Event Study (AR/CAR with expected return = 0). It highlights how choices like weight scheme, date range, and event window change results. *No rebalancing; no baseline model.*
 
 **1) Portfolio Simulator — build & backtest portfolios**
 - **What it does:** Simulates a buy-and-hold portfolio from your tickers with two weight options (Equal or Inverse-price), custom date range, and starting cash.
 - **How to use:** 
-  1) Enter tickers separated by spaces (no commas), e.g., `AAPL MSFT NVDA`
+  1) Enter tickers separated by spaces (no commas), e.g., AAPL, MSFT, NVDA
   2) Set dates
   3) Choose weighting
   4) Click "Simulate".
 - **Weights** (2-stock example)
-  - Equal weight: <span class="mjx">$ w_i = \frac{1}{N} $</span>. With \$10{,}000, AAPL \$200 & MSFT \$100 → \$5{,}000 each → 25 AAPL, 50 MSFT.
-  - Inverse-price: <span class="mjx">$ w_i=\frac{1/P_i}{\sum_{j} 1/P_j} $</span>. Same prices → ≈33% AAPL / 67% MSFT → \$3{,}333 AAPL (≈16.7 sh), \$6{,}667 MSFT (≈66.7 sh).
-- **Outputs:** Portfolio wealth ($) time series, total period return (%), optional daily return series, start→end wealth summary, and per-ticker normalized cumulative lines; CSV export. *(No turnover or trade list—there’s no rebalancing.)*
-- **Under the hood:** Weights are fixed once at <span class="mjx">$ t_0 $</span> (equal or inverse-price using the first available `close`). Returns use simple returns derived from adj-close log returns; portfolio wealth is a fixed linear combo of each asset’s growth index. *No rebalancing*, *no transaction costs*; *fractional shares implied*.
+  - Equal weight: <span class="nowrap">w<sub>i</sub> = 1/N</span>. With 10,000 dollars, AAPL 200 dollars/share &amp; MSFT 100 dollars/share → 5,000 dollars each → 25 AAPL, 50 MSFT.
+  - Inverse-price: <span class="nowrap">w<sub>i</sub> = (1/P<sub>i</sub>) / Σ<sub>j</sub>(1/P<sub>j</sub>)</span>. Same prices → ≈33% AAPL / 67% MSFT → 3,333 AAPL (≈16.7 shares), 6,667 MSFT (≈66.7 shares).
+- **Outputs:** Portfolio wealth (\$) time series, total period return (%), optional daily return series, start→end wealth summary, and per-ticker normalized cumulative lines; CSV export. *(No turnover or trade list—there’s no rebalancing.)*
+- **Under the hood:** Weights are fixed once at <span class="nowrap">t<sub>0</sub></span> (equal or inverse-price using the first available `close`). Returns use simple returns derived from adj-close log returns; portfolio wealth is a fixed linear combo of each asset’s growth index. *No rebalancing*, *no transaction costs*; *fractional shares implied*.
 
 **2) Sector Explorer — compare trends across sectors**
 - **What it does:** Benchmarks selected sectors/industries over a window with indexed performance (base=1), rolling returns, and a return-correlation view.
@@ -467,12 +518,12 @@ An interactive toolkit with three workflows—Portfolio Simulator (buy-and-hold 
 - **Beta note — “Equal-weight within sector”**
   - This selector is in *beta*; *currently it has no effect*. Sectors are always computed as an equal-weight average of their member tickers (not cap-weighted).
     - **What “equal-weight within sector” means (example)**
-      - Tech = {AAPL, MSFT} → 50%/50%; sector daily return = mean(<span class="mjx">$ r_{\text{AAPL}} $</span>, <span class="mjx">$ r_{\text{MSFT}} $</span>).
-      - Health = {JNJ, PFE, MRK} → 33⅓% each; sector daily return = mean(<span class="mjx">$ r_{\text{JNJ}} $</span>, <span class="mjx">$ r_{\text{PFE}} $</span>, <span class="mjx">$ r_{\text{MRK}} $</span>).  
+      - Tech = {AAPL, MSFT} → 50%/50%; sector daily return = mean(<span class="nowrap">r<sub>AAPL</sub></span>, <span class="nowrap">r<sub>MSFT</sub></span>).
+      - Health = {JNJ, PFE, MRK} → 33% each; sector daily return = mean(<span class="nowrap">r<sub>JNJ</sub></span>, <span class="nowrap">r<sub>PFE</sub></span>, <span class="nowrap">r<sub>MRK</sub></span>).  
       - Each sector’s line is then indexed to 1 at the start of your window.
 
 **3) Event Study — measure market reaction around news**
-- **What it does:** Aligns price moves around one or more event dates (e.g., earnings, SEC filings) to compute abnormal return (AR) and cumulative abnormal return (CAR) with expected return = 0 (so <span class="nowrap">AR<sub>t</sub> = r<sub>t</sub>; CAR = Σ AR<sub>τ</sub></span>)
+- **What it does:** Aligns price moves around one or more event dates (e.g., earnings, SEC filings) to compute abnormal return (AR) and cumulative abnormal return (CAR) with expected return = 0 (so <span class="nowrap">AR<sub>t</sub> = r<sub>t</sub>; CAR = Σ AR<sub>τ</sub></span>).
 - **How to use:**
   1) Choose a ticker and an event window (e.g., −10 to +10 trading days).
   2) Enter one or more dates (YYYY-MM-DD; spaces or commas are fine).
@@ -500,64 +551,71 @@ app_ui = ui.page_fluid(
 
         ui.nav_panel(
             "About",
-            head_links,
-            ui.layout_columns(
-                ui.div(
-                    ui.img(
-                        src="new_profile_picture.png",
-                        alt="Portrait of Ozkan Gelincik",
-                        class_="mb-3", width="100%"
-                    ),
-                    ui.h4("Ozkan Gelincik", class_="fw-bold"),
-                    ui.hr(),
+            ui.div(
+                ui.layout_columns(
                     ui.div(
-                        ui.span("NYCDSA · Data Science with Machine Learning",
-                                class_="badge rounded-pill pill-nycdsa"),
-                        ui.span("Weill Cornell Medicine · 10+ years",
-                                class_="badge rounded-pill pill-cornell"),
-                        ui.span("Cancer Research Operations",
-                                class_="badge rounded-pill pill-ops"),
-                        class_="about-badges d-flex flex-wrap gap-2 mb-4"
+                        ui.img(
+                            src="new_profile_picture.png",
+                            alt="Portrait of Ozkan Gelincik",
+                            class_="mb-3", width="100%"
+                        ),
+                        ui.h4("About the author", class_="fw-bold"),
+                        ui.markdown(
+                            '''
+                            I’m Ozkan Gelincik—cancer-research operations leader turned data scientist. After 10+ years at Weill Cornell Medicine advancing cancer-prevention research and publishing in top-tier medical journals, I now build end-to-end data pipelines, machine-learning models, and interactive visualizations that turn messy data into clear, actionable decisions.
+                            '''
+                        ),
+                        ui.hr(),
+                        ui.div(
+                            ui.span("NYC Data Science Academy · DS/ML",
+                                    class_="badge rounded-pill pill-nycdsa"),
+                            ui.span("Weill Cornell Medicine · 10+ years",
+                                    class_="badge rounded-pill pill-cornell"),
+                            ui.span("Cancer Research Operations",
+                                    class_="badge rounded-pill pill-ops"),
+                            class_="about-badges d-flex flex-wrap gap-2 mb-4"
+                        ),
+                        ui.hr(),
+                        ui.div(
+                            ui.a(
+                                ui.tags.i(class_="fa-brands fa-linkedin-in fa-lg"),
+                                href="https://www.linkedin.com/in/ozkangelincik/",
+                                class_="btn btn-outline-primary btn-sm me-2 btn-icon",
+                                target="_blank", rel="noopener noreferrer",
+                                **{"aria-label": "LinkedIn"},
+                            ),
+                            ui.a(
+                                ui.tags.i(class_="fa-brands fa-github fa-lg"),
+                                href="https://github.com/OzkanGelincik",
+                                class_="btn btn-outline-secondary btn-sm me-2 btn-icon",
+                                target="_blank", rel="noopener noreferrer",
+                                **{"aria-label": "GitHub"},
+                            ),
+                            ui.a(
+                                ui.tags.i(class_="fa-brands fa-researchgate fa-lg"),
+                                href="https://www.researchgate.net/profile/Ozkan-Gelincik",
+                                class_="btn btn-outline-dark btn-sm me-2 btn-icon",
+                                target="_blank", rel="noopener noreferrer",
+                                **{"aria-label": "ResearchGate"},
+                            ),
+                            ui.a(
+                                ui.tags.i(class_="ai ai-google-scholar-square ai-lg"),  # square variant is nice
+                                href="https://scholar.google.com/citations?user=2bcmUHoAAAAJ&hl=en",
+                                class_="btn btn-outline-success btn-sm btn-icon",
+                                target="_blank", rel="noopener noreferrer",
+                                **{"aria-label": "Google Scholar"},
+                            ),
+                        ),
+                        class_="about-left",
                     ),
-                    ui.hr(),
                     ui.div(
-                        ui.a(
-                            ui.tags.i(class_="fa-brands fa-linkedin-in fa-lg"),
-                            href="https://www.linkedin.com/in/ozkangelincik/",
-                            class_="btn btn-outline-primary btn-sm me-2 btn-icon",
-                            target="_blank", rel="noopener noreferrer",
-                            **{"aria-label": "LinkedIn"},
-                        ),
-                        ui.a(
-                            ui.tags.i(class_="fa-brands fa-github fa-lg"),
-                            href="https://github.com/OzkanGelincik",
-                            class_="btn btn-outline-secondary btn-sm me-2 btn-icon",
-                            target="_blank", rel="noopener noreferrer",
-                            **{"aria-label": "GitHub"},
-                        ),
-                        ui.a(
-                            ui.tags.i(class_="fa-brands fa-researchgate fa-lg"),
-                            href="https://www.researchgate.net/profile/Ozkan-Gelincik",
-                            class_="btn btn-outline-dark btn-sm me-2 btn-icon",
-                            target="_blank", rel="noopener noreferrer",
-                            **{"aria-label": "ResearchGate"},
-                        ),
-                        ui.a(
-                            ui.tags.i(class_="ai ai-google-scholar-square ai-lg"),  # square variant is nice
-                            href="https://scholar.google.com/citations?user=2bcmUHoAAAAJ&hl=en",
-                            class_="btn btn-outline-success btn-sm btn-icon",
-                            target="_blank", rel="noopener noreferrer",
-                            **{"aria-label": "Google Scholar"},
-                        ),
+                        ui.markdown(about_markdown),
+                        class_="about-right",
                     ),
-                    class_="about-left",
+                    col_widths=(3, 8),
+                    row_classes="gx-0",  # let our CSS control the gap
                 ),
-                ui.div(
-                    ui.markdown(about_markdown),
-                    class_="about-right",
-                ),
-                col_widths=(3, 8),
-                row_classes="gx-0",  # let our CSS control the gap
+                class_="about",
             ),
         ),
 
@@ -666,17 +724,20 @@ app_ui = ui.page_fluid(
                         ui.download_button("ind_dl", "Download table (CSV)"),                                           
                     ),
                 ),
-            ),           
-        ),
+            ),
+        ),           
 
-        ui.nav_panel("Appendix",
-            ui.markdown(appendix_markdown)
+        ui.nav_panel(
+            "Appendix",
+            ui.div(
+                ui.markdown(appendix_markdown),
+                class_="appendix"
+            ),
         ),
-    
-    )
+    )   
 )
 
-www_dir = Path(__file__).parent / "www"
+
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║  Server logic                                                            ║
@@ -726,6 +787,7 @@ def server(input, output, session):
 
         # Per-ticker cumulative index (start at 1)
         cum = (1.0 + r_wide).cumprod()
+        cum = cum.div(cum.iloc[0].replace(0, np.nan), axis=1).fillna(1.0)
 
         if eq:
             # --- BUY-AND-HOLD (equal dollars at start, no rebalancing) ---
