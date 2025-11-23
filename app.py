@@ -358,11 +358,13 @@ Select filing/split types, a window (±k trading days), and optional sector filt
   - SEC EDGAR API (submissions + companyfacts JSON (`/api/xbrl/companyfacts/CIK{cik}.json`) via `requests`) for CIK/SIC, filings, shares/public float
 - **Caching/IO** - Parquet for fast reloads; local JSON cache for SEC responses; CSV export from the app. *No DuckDB used.*
 
-## **Data & caveats** • Educational use only — **not financial advice**.  
-• Market data may be delayed and subject to API limits.  
-• Results are demo estimates; verify independently.
+## **Data & caveats** 
+- Educational use only — **not financial advice**.  
+- Market data may be delayed and subject to API limits.  
+- Results are demo estimates; verify independently.
 
-## **Contact** Use the buttons above (LinkedIn, GitHub, ResearchGate, Google Scholar).  
+## **Contact** 
+Use the buttons above (LinkedIn, GitHub, ResearchGate, Google Scholar).  
 
 ## **Acknowledgments**
 *Grateful to the NYC Data Science Academy community—especially Vinod Chugani, Jonathan Harris, Joe Lu, David Wasserman, Andrew Dodd, and Luke Lin—for thoughtful, actionable feedback. Thanks also to the open-source maintainers and data providers—`yfinance`, `yahoo_fin`, `yahooquery`, and SEC EDGAR—that made this project possible.*

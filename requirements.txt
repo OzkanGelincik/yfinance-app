@@ -4,3 +4,5 @@ numpy==2.3.4
 matplotlib==3.9.2
 pyarrow==22.0.0
 Jinja2
+plotly>=5.20
+shinywidgets>=0.3
