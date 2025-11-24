@@ -23,6 +23,10 @@ import numpy as np
 import pandas as pd
 from shiny import App, ui, render, reactive
 from shiny.ui import tags
+from shinywidgets import output_widget, render_widget   # <-- add this
+# (In the UI we’ll use ui.output_widget(...))
+import plotly.graph_objects as go
+import plotly.express as px
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║  Locate & load dataset                                                   ║
@@ -34,6 +38,8 @@ APP_DIR = Path(__file__).resolve().parent
 OUT_DIR = APP_DIR / "outputs"
 
 SEC_CSV = OUT_DIR / "sec_filing_descriptions.csv"
+
+ETF_CSV = OUT_DIR / "top_100_etfs_described.csv"
 
 www_dir = Path(__file__).parent / "www"
 
@@ -220,6 +226,47 @@ event_types = sorted(EVENTS["event_type"].dropna().unique().tolist())
 ticker_choices = sorted(AE["ticker"].dropna().unique().tolist())
 dlo, dhi = _dater_default(AE, 252)
 
+# Add a tiny color-map helper (top of file, near other helpers)
+def _build_color_map(labels):
+    """Stable ticker→color map (same color for a ticker across all pies)."""
+    palette = (px.colors.qualitative.D3
+               + px.colors.qualitative.Set2
+               + px.colors.qualitative.Plotly)
+    labs = sorted(pd.Index(labels).unique())
+    return {lab: palette[i % len(palette)] for i, lab in enumerate(labs)}
+
+# Update your pie factory to accept the map and enforce order
+def _pie_fig(*, names, values, title, hole=0.35, unit=None, percent=True, color_map=None):
+    # if a color_map is given, reindex to that order to keep legend/slice order stable
+    ser = pd.Series(values, index=pd.Index(names, name="ticker"))
+    if color_map:
+        ordered = [t for t in color_map.keys() if t in ser.index]
+        ser = ser.reindex(ordered)
+
+    fig = px.pie(
+        names=ser.index,
+        values=ser.values,
+        hole=hole,
+        title=title,
+        color=ser.index,                       # color by ticker
+        color_discrete_map=color_map or {},    # enforce our mapping
+    )
+
+    # hover text
+    if unit == "currency":
+        ht = "%{label}: $%{value:,.0f}"
+    elif unit == "shares":
+        ht = "%{label}: %{value:,.4f} sh"
+    else:
+        ht = "%{label}: %{value}"
+    if percent:
+        ht += " (%{percent})"
+    fig.update_traces(hovertemplate=ht + "<extra></extra>", textinfo="percent")
+
+    fig.update_layout(margin=dict(l=10, r=10, t=50, b=10), title_x=0.5, legend_title_text="Ticker")
+    return fig
+
+
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║  UI Layout                                                               ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
@@ -293,6 +340,32 @@ head_links = ui.head_content(
         margin-top: 0.25rem !important;
         }
     """),
+
+    # … your <link> tags …
+    ui.tags.style("""
+      :root { --block-gap: 1.25rem; }  /* tweak once, affects all outputs */
+
+      /* Most Shiny outputs */
+      .shiny-output,
+      .shiny-plot-output,
+      .shiny-text-output,
+      .shiny-table-output,
+      .shiny-html-output,
+      .shiny-data-frame-output,
+      /* Plotly/HTML-widget containers */
+      .html-widget,
+      /* shinywidgets output container */
+      .py-shiny-output-widget,
+      /* DataFrame grid (shiny.render.data_frame) */
+      .data-grid,
+      .dataframe {
+        margin-bottom: var(--block-gap);
+      }
+
+      /* Optional: slightly tighter spacing inside sidebars for inputs */
+      .sidebar .shiny-input-container { margin-bottom: .75rem; }
+    """),
+
 )
 
 
@@ -343,7 +416,7 @@ Select filing/split types, a window (±k trading days), and optional sector filt
   <a href="#tab-Appendix"
      class="link-button"
      onclick="if(!window.goToTabByText||!goToTabByText('Appendix')){return true;} return false;">
-     Appendix: Dive deeper into each function →
+     Appendix: Learn more about what each function does and how returns were calculated (i.e., simple and log returns) →
   </a>
 </span>
 <div class="mt-3"></div>
@@ -536,7 +609,148 @@ An interactive toolkit with three workflows—Portfolio Simulator (buy-and-hold 
   - Averages across multiple events are equal-weight.
   - *No transaction costs; educational use only.*
 > *Future idea:* add optional baselines (constant-mean or market model vs. a benchmark) and an explicit estimation window.
+
+---
+
+## **Returns: definitions & conversions**
+
+- **Definitions**
+    - **Simple return:** <span class="nowrap">r = (P<sub>t</sub> − P<sub>t−1</sub>) / P<sub>t−1</sub> = P<sub>t</sub> / P<sub>t−1</sub> − 1</span>
+    - **Log return:** <span class="nowrap">g = ln(P<sub>t</sub> / P<sub>t−1</sub>) = ln(1 + r)</span>
+<br><br>
+- **Convert between them**
+    - <span class="nowrap">simple → log: g = ln(1 + r)</span>
+    - <span class="nowrap">log → simple: r = e<sup>g</sup> − 1</span> (this is what <code>np.expm1(g)</code> does)
+<br><br>
+- **Over multiple days**
+    - **Cumulative simple:** <span class="nowrap">R = ∏<sub>i</sub> (1 + r<sub>i</sub>) − 1</span>
+    - **Cumulative log:** <span class="nowrap">G = Σ<sub>i</sub> g<sub>i</sub></span>
+    - **Relationship:** <span class="nowrap">G = ln(1 + R)</span> and <span class="nowrap">R = e<sup>G</sup> − 1</span>
+<br><br>
+- **Rule of thumb:** for small returns, <span class="nowrap">ln(1 + r) ≈ r − r<sup>2</sup>/2</span> (so log ≈ simple).
+
+**Example.** If <span class="nowrap">r = 0.05</span>, then <span class="nowrap">g = ln(1.05) ≈ 0.04879</span>. Conversely, <span class="nowrap">g = 0.04879 → r = e<sup>0.04879</sup> − 1 ≈ 0.05</span>.
+
+**Why `np.expm1(CAR)`?** CAR is a **sum of log returns**, so <span class="nowrap">percent ≈ e<sup>CAR</sup> − 1</span>, which is exactly what <code>np.expm1</code> computes.
 """
+
+etfs_markdown = '''
+
+# **Understanding the top-100 ETFs table**
+These listed ETFs were taken from [ETF Database](https://etfdb.com/compare/market-cap/) on 24/11/2025.
+
+---
+
+## **Tracking_Index**  
+  The specific benchmark index the ETF is designed to track (e.g., S&P 500 Index, CRSP US Total Market Index, Nasdaq-100 Index).  
+  For active funds, this is noted as `"N/A (Active)"`.
+
+---
+  
+## **Methodology**  
+How the ETF tracks its index:
+
+  - **Full Replication**  
+    The fund buys all the securities in the index with the same weightings.  
+    *(Common for S&P 500 and Nasdaq-100 ETFs).*
+
+  - **Sampling**  
+    The fund buys a representative sample of securities to mimic the index's risk/return profile without holding every single stock/bond.  
+    *(Common for Total Market and Bond ETFs).*
+
+  - **Active Management**  
+    The fund manager makes active investment decisions rather than tracking an index (e.g., JEPI, JEPQ).
+
+  - **Physical Backing**  
+    The fund holds the actual asset (e.g., gold or bitcoin).
+
+---
+    
+## **Diversification**  
+  Indicates the breadth of the fund's holdings (e.g., broad market, sector-specific, or single commodity).
+
+---
+
+## **Exposure Description**
+
+#### **1. General Format**
+
+- **Equities (Stocks):**
+`Region/Style: ~% Top Sector 1, ~% Top Sector 2...`
+    - Example:  
+    *"US Large Cap: ~31% Tech, ~14% Fin..."* means the fund invests in big US companies, and its performance is most heavily influenced by Technology (31%) and Financials (14%).
+
+- **Bonds (Fixed Income):**  
+`Credit Quality/Type: ~% Breakdown by Issuer Type`
+    - Example:  
+    *"US Inv Grade Bonds: ~43% Treasuries..."* means the fund holds safe US debt, split between Government bonds (Treacheries) and other types.
+
+- **Commodities/Alternative:**  
+`Type: 100% Underlying Asset`
+    - Example:  
+    *"Commodity: 100% Physical Gold"*
+
+#### **2. Abbreviations Key**
+
+- **Sectors (What industry the companies are in)**
+
+    - **Tech:** Information Technology (e.g., Apple, Microsoft, Nvidia)  
+    - **Fin:** Financials (e.g., Chase, Visa, Berkshire Hathaway)  
+    - **Health:** Healthcare (e.g., UnitedHealth, Eli Lilly)  
+    - **Cons Disc:** Consumer Discretionary (non-essential goods like Amazon, Tesla, McDonald's)  
+    - **Comm Svcs:** Communication Services (e.g., Google/Alphabet, Meta, Netflix)  
+    - **Ind:** Industrials (e.g., Caterpillar, GE, Aerospace)  
+    - **Cons Staples:** Consumer Staples (essential goods like P&G, Walmart, Coke)  
+    - **Real Estate / REITs:** Real Estate Investment Trusts  
+
+- **Bond Types**
+
+    - **Treasuries:** Debt issued by the US Government (safest).  
+    - **MBS:** Mortgage-Backed Securities (pools of home loans, usually agency-backed).  
+    - **Corporates:** Debt issued by companies.  
+    - **Inv Grade:** Investment Grade (high credit quality, lower risk).  
+    - **High Yield / Junk:** Non-investment grade (lower credit quality, higher risk/yield).  
+    - **Muni:** Municipal Bonds (issued by states/cities, often tax-exempt).  
+
+- **Regions
+
+    - **Dev Markets:** Developed Markets (advanced economies like UK, Japan, France, Canada).  
+    - **Emerging Markets:** Developing economies (China, India, Brazil, Taiwan).  
+
+#### **3. Important Note on Percentages (`~`)**
+
+You will see the tilde symbol (`~`) before percentage numbers. This indicates an **approximation**.
+
+- ETF weightings change daily as stock prices move.  
+- The values provided are based on typical benchmark index weightings (e.g., the S&P 500 is historically roughly 30% Tech).  
+- `"100%"` implies the fund is a *pure-play* on that specific asset (e.g., a Gold trust or a specific sector fund).
+
+---
+
+## **Cost (Expense Ratio)**  
+  Estimated expense tier:
+  - Ultra Low: ~0.03%  
+  - Low: ~0.10%  
+  - Moderate: >0.15%
+
+---
+  
+## **Trading Flexibility**  
+  All top 100 ETFs have high liquidity; specific highly traded ones like SPY/QQQ are noted as **"Very High"**.
+
+---  
+  
+## **Transparency**  
+  Almost all ETFs disclose holdings daily (**"High"**).
+
+---
+
+## **Tax Efficiency**  
+  - Equity ETFs: generally **High**  
+  - Bond ETFs: produce taxable interest (**Moderate**)  
+  - Gold/Commodities: often have special tax treatments (**Low**)
+
+'''
 
 # This is the main UI definition you can use in your nav_panel
 dataset_build_ui = ui.div(
@@ -648,8 +862,16 @@ app_ui = ui.page_fluid(
                 ),
                 ui.div(
                     ui.output_text("p_summary"),
-                    ui.output_plot("p_plot"),
+                    output_widget("p_plot"),
                     ui.output_table("p_tbl"),
+                    # ⬇️ add this block
+                    ui.layout_columns(
+                        output_widget("p_pie_weights_spent"), # $ allocation & implied weights
+                        output_widget("p_pie_shares"),        # initial shares
+                        output_widget("p_pie_final"),         # end-of-period $ contribution
+                        col_widths=(4, 4, 4),  # 4 columns
+                        row_classes="gy-3"     # a little vertical space between rows on wrap
+                    ),
                     ui.download_button("p_dl", "Download portfolio series (CSV)"),
                 ),
             ),
@@ -671,7 +893,7 @@ app_ui = ui.page_fluid(
                 ),
                 ui.div(
                     ui.output_text("s_summary"),
-                    ui.output_plot("s_plot"),
+                    output_widget("s_plot"),
                     ui.output_table("s_tbl"),
                     ui.download_button("s_dl", "Download sector indices (CSV)"),
                 ),
@@ -682,7 +904,7 @@ app_ui = ui.page_fluid(
         ui.nav_menu(
             "Event Study",
             ui.nav_panel("Intro to SEC Filings",
-                ui.output_table("sec_desc_tbl"),
+                ui.output_data_frame("sec_desc_tbl"),
             ),
             ui.nav_panel("Sector Study",
                 ui.layout_sidebar(
@@ -690,7 +912,7 @@ app_ui = ui.page_fluid(
                         ui.input_selectize("etype", "Event type(s)", event_types, multiple=True, selected=event_types[:1] if event_types else []),
                         ui.input_slider("k", "Event window (trading days)", min=1, max=20, value=5),
                         ui.input_date_range("dater", "Event date range (Data available: 9/30/2024-9/30/2025)", start=dlo, end=dhi),
-                        ui.input_checkbox_group("sector", "Sectors", sector_choices, inline=True),
+                        ui.input_checkbox_group("sector", "Sectors", sector_choices, inline=False),
                         ui.input_checkbox("no_overlap", "Exclude overlapping days (co-occurring events)", value=False),
                         ui.input_action_button("go", "Run"),
                         ui.hr(),
@@ -700,7 +922,7 @@ app_ui = ui.page_fluid(
                     ),
                     ui.div(
                         ui.output_text("summary"),
-                        ui.output_plot("car_plot"),
+                        output_widget("car_plot"),
                         ui.output_table("tbl"),
                         ui.download_button("dl", "Download table (CSV)"),
                     ),
@@ -721,13 +943,27 @@ app_ui = ui.page_fluid(
                     ),
                     ui.div(
                         ui.output_text("ind_summary"),
-                        ui.output_plot("ind_car_plot"),
+                        output_widget("ind_car_plot"),
                         ui.output_table("ind_tbl"),
                         ui.download_button("ind_dl", "Download table (CSV)"),                                           
                     ),
                 ),
             ),
         ),           
+
+        ui.nav_menu(
+            "Top 100 ETFs",
+            ui.nav_panel("Explore top ETFs",
+                ui.output_data_frame("etfs_tbl"),                      
+            ),
+            ui.nav_panel("ETF Table Descriptions",                      
+                ui.div(     
+                    ui.markdown(etfs_markdown),
+                    # Add some padding for better readability
+                    {"style": "padding: 2rem;"}
+                ),
+            ),            
+        ), 
 
         ui.nav_panel(
             "Appendix",
@@ -736,6 +972,7 @@ app_ui = ui.page_fluid(
                 class_="appendix"
             ),
         ),
+   
     )   
 )
 
@@ -836,6 +1073,142 @@ def server(input, output, session):
         )
         out.index = pd.to_datetime(out.index)
         return out
+    
+    # ---- Portfolio meta (weights, $spent, shares, final values) -----------------
+    @reactive.calc
+    @reactive.event(input.p_go)
+    def _p_meta():
+        """
+        Returns dict of Series (index = ticker):
+        w0           : initial weights (sum≈1 across usable tickers)
+        p0           : first close in window
+        spent        : initial dollars allocated = amt * w0
+        shares0      : fractional shares = spent / p0
+        final_values : end-of-period dollars per ticker = spent * cum_last
+        """
+        tickers, amt, eq, d0, d1 = _p_params()
+        if not tickers:
+            return None
+
+        df = AE.loc[
+            (AE["ticker"].isin(tickers)) & (AE["date"].between(d0, d1)),
+            ["date", "ticker", "logret", "close"],
+        ].copy()
+        if df.empty:
+            return None
+
+        # daily simple returns → wide
+        df["r"] = _simple_returns(df["logret"])
+        r_wide = (
+            df.pivot_table(index="date", columns="ticker", values="r", aggfunc="mean")
+            .sort_index()
+            .fillna(0.0)
+        )
+        if r_wide.shape[1] == 0:
+            return None
+
+        # cumulative index rebased to 1
+        cum = (1.0 + r_wide).cumprod()
+        cum = cum.div(cum.iloc[0].replace(0, np.nan), axis=1).fillna(1.0)
+
+        # first close per ticker (for shares & inverse-price)
+        p0 = (
+            df.sort_values("date")
+            .dropna(subset=["close"])
+            .groupby("ticker")["close"]
+            .first()
+            .reindex(r_wide.columns)
+        )
+
+        # weights
+        if eq:
+            n = r_wide.shape[1]
+            w0 = pd.Series(1.0 / max(1, n), index=r_wide.columns)
+        else:
+            invp = 1.0 / p0.replace(0, np.nan)
+            if np.isfinite(invp).sum() == 0:
+                w0 = pd.Series(1.0 / r_wide.shape[1], index=r_wide.columns)
+            else:
+                w0 = (invp / invp.sum()).fillna(0.0)
+
+        spent        = (amt * w0).fillna(0.0)
+        shares0      = (spent / p0.replace(0, np.nan)).fillna(0.0)
+        cum_last     = cum.iloc[-1]
+        final_values = (spent * cum_last).fillna(0.0)
+
+        # keep original column order for stable labeling
+        idx = r_wide.columns
+        return {
+            "w0": w0.loc[idx],
+            "p0": p0.loc[idx],
+            "spent": spent.loc[idx],
+            "shares0": shares0.loc[idx],
+            "final_values": final_values.loc[idx],
+        }
+
+    # Reactive color map for the current portfolio selection
+    @reactive.calc
+    def _p_color_map():
+        """Compute a stable ticker→color mapping for the current selection."""
+        m = _p_meta()
+        if not m:
+            return {}
+        # ⚠️ If your _p_meta uses 'shares0'/'final_values', mirror those names here:
+        labels = (pd.Index(m["spent"].index)
+                .union(m["shares0"].index)
+                .union(m["final_values"].index))
+        return _build_color_map(labels)
+
+
+    @output
+    @render_widget
+    @reactive.event(input.p_go)
+    def p_pie_weights_spent():
+        m = _p_meta()
+        if not m:
+            return None
+        cmap = _p_color_map()
+        s = m["spent"]
+        return _pie_fig(
+            names=s.index, values=s.values,
+            title="Initial $ allocation (weights)",
+            unit="currency", percent=True,
+            color_map=cmap,
+        )
+
+    @output
+    @render_widget
+    @reactive.event(input.p_go)
+    def p_pie_shares():
+        m = _p_meta()
+        if not m:
+            return None
+        cmap = _p_color_map()
+        s = m["shares0"] # shares bought at start
+        return _pie_fig(
+            names=s.index, values=s.values,
+            title="Initial shares",
+            unit="shares", percent=True, # percent of shares isn’t very meaningful
+            color_map=cmap,
+        )
+
+
+    @output
+    @render_widget
+    @reactive.event(input.p_go)
+    def p_pie_final():
+        m = _p_meta()
+        if not m:
+            return None
+        cmap = _p_color_map()
+        s = m["final_values"] # end-of-period $ per ticker
+        return _pie_fig(
+            names=s.index, values=s.values,
+            title="Final value by ticker",
+            unit="currency", percent=True,
+            color_map=cmap,
+        )
+    
 
     @output
     @render.text
@@ -853,19 +1226,40 @@ def server(input, output, session):
         )
 
     @output
-    @render.plot
+    @render_widget
     @reactive.event(input.p_go)
     def p_plot():
-        import matplotlib.pyplot as plt
         df = p_panel()
-        fig, ax = plt.subplots()
+        fig = go.Figure()
+
         if df.empty:
-            ax.text(0.5, 0.5, "No data", ha="center")
+            fig.add_annotation(
+                text="No data",
+                x=0.5, y=0.5, xref="paper", yref="paper",
+                showarrow=False, font=dict(size=14)
+            )
+            fig.update_layout(template="plotly_white")
             return fig
-        ax.plot(df.index, df["portfolio_$"])  # no explicit color
-        ax.set_title("Assets Under Management ($)")
-        ax.set_xlabel("Date")
-        ax.set_ylabel("Value ($)")
+
+        fig.add_trace(
+            go.Scatter(
+                x=df.index, y=df["portfolio_$"],
+                mode="lines",
+                name="Portfolio",
+                hovertemplate="%{x|%Y-%m-%d}<br>$%{y:,.0f}<extra></extra>",
+            )
+        )
+
+        fig.update_layout(
+            title="Assets Under Management ($)",
+            xaxis_title="Date",
+            yaxis_title="Value ($)",
+            title_x = 0.5,
+            template="plotly_white",
+            hovermode="x unified",
+            margin=dict(t=60, r=20, b=40, l=60),
+        )
+        fig.update_yaxes(tickprefix="$", separatethousands=True)
         return fig
 
     @output
@@ -954,22 +1348,42 @@ def server(input, output, session):
         return f"Sectors: {', '.join(cols)}  |  Days: {len(df)}"
 
     @output
-    @render.plot
+    @render_widget
     @reactive.event(input.s_go)
     def s_plot():
-        import matplotlib.pyplot as plt
         df = s_panel()
-        fig, ax = plt.subplots()
+        fig = go.Figure()
+
         if df.empty:
-            ax.text(0.5, 0.5, "No data", ha="center")
+            fig.add_annotation(
+                text="No data",
+                x=0.5, y=0.5, xref="paper", yref="paper",
+                showarrow=False, font=dict(size=14)
+            )
+            fig.update_layout(template="plotly_white")
             return fig
+
         # one line per sector
         for c in df.columns:
-            ax.plot(df.index, df[c], label=c)
-        ax.legend()
-        ax.set_title("Sector Cumulative Indices (start = 1)")
-        ax.set_xlabel("Date")
-        ax.set_ylabel("Index")
+            fig.add_trace(
+                go.Scatter(
+                    x=df.index, y=df[c],
+                    mode="lines",
+                    name=c,
+                    hovertemplate="%{x|%Y-%m-%d}<br>Index: %{y:.3f}<extra></extra>",
+                )
+            )
+
+        fig.update_layout(
+            title="Sector Cumulative Indices (start = 1)",
+            xaxis_title="Date",
+            yaxis_title="Index",
+            title_x = 0.5,
+            template="plotly_white",
+            hovermode="x unified",
+            legend_title_text="Sector",
+            margin=dict(t=60, r=20, b=40, l=60),
+        )
         return fig
 
     @output
@@ -1094,37 +1508,90 @@ def server(input, output, session):
         )
 
     @output
-    @render.plot
+    @render_widget
     @reactive.event(input.go)
     def car_plot():
         """
-        Plot Average CAR with a simple ±95% CI ribbon.
+        Plot Average CAR with a ±95% CI ribbon using Plotly.
         CAR = cumulative sum of mean log returns across rel_day.
-        CI uses normal approximation: mean ± 1.96 * SE, where SE = std / sqrt(n).
         """
-        import matplotlib.pyplot as plt
-
         df = panel()
-        fig, ax = plt.subplots()
+        fig = go.Figure()
+
         if df.empty:
-            ax.text(0.5, 0.5, "No events selected", ha="center")
+            fig.add_annotation(
+                text="No events selected",
+                x=0.5, y=0.5, xref="paper", yref="paper",
+                showarrow=False, font=dict(size=14)
+            )
+            fig.update_layout(template="plotly_white")
             return fig
 
         g = df.groupby("rel_day")["logret"]
-        mu = g.mean().sort_index()                       # mean return per rel_day
-        n = g.count().sort_index()                       # sample size per rel_day
+        mu = g.mean().sort_index()                                # mean return per rel_day
+        n  = g.count().sort_index()                               # sample size per rel_day
         se = g.std(ddof=1).sort_index() / np.sqrt(n.clip(lower=1))  # standard error
 
-        car = mu.cumsum()                                # cumulative mean
-        car_lo = (mu - 1.96 * se).cumsum()               # lower CI
-        car_hi = (mu + 1.96 * se).cumsum()               # upper CI
+        car    = mu.cumsum()
+        car_lo = (mu - 1.96 * se).cumsum()
+        car_hi = (mu + 1.96 * se).cumsum()
 
-        ax.plot(car.index, car.values)
-        ax.fill_between(car.index, car_lo.values, car_hi.values, alpha=0.2)
-        ax.axvline(0, linestyle="--")                    # mark event day
-        ax.set_xlabel("Relative day")
-        ax.set_ylabel("Avg CAR")
-        ax.set_title("Average Cumulative Abnormal Return (±95% CI)")
+        xvals = car.index.values
+
+        # after you compute mu, n, se, car, car_lo, car_hi
+        xvals = car.index.astype(int)
+
+        fig = go.Figure()
+
+
+        # CI ribbon: add upper, then lower with fill='tonexty'
+        # CI ribbon
+        ci_rgba = "rgba(31, 119, 180, 0.20)"   # 20% opacity; tweak last number (0–1)
+
+        # upper bound (no visible line)
+        fig.add_trace(go.Scatter(
+            x=xvals, y=car_hi.values,
+            line=dict(width=0, color="rgba(0,0,0,0)"),
+            hoverinfo="skip", showlegend=False, name="CI hi"
+        ))
+
+        # lower bound + fill to previous
+        fig.add_trace(go.Scatter(
+            x=xvals, y=car_lo.values,
+            fill="tonexty",
+            fillcolor=ci_rgba,                  # <<< controls ribbon opacity
+            line=dict(width=0, color="rgba(0,0,0,0)"),
+            name="95% CI", showlegend=True, hoverinfo="skip"
+        ))
+
+        # main CAR line (with % shown in hover via customdata)
+        fig.add_trace(go.Scatter(
+            x=xvals, y=car.values, mode="lines", name="Avg CAR",
+            customdata=np.expm1(car.values),  # ≈ percent return
+            meta=n.values,                    # sample size at each rel_day
+            hovertemplate=(
+                "Day %{x}<br>"
+                "CAR (log): %{y:.4f}<br>"
+                "CAR (≈%): %{customdata:.2%}<br>"
+                "n: %{meta}<extra></extra>"
+            )
+        ))
+
+
+        # Event-day vertical line at 0
+        fig.add_vline(x=0, line_dash="dash", line_color="black", opacity=0.6)
+
+        fig.update_layout(
+            title="Average Cumulative Abnormal Log Return (±95% CI)",
+            xaxis_title="Relative day",
+            yaxis_title="Avg CAR (log units)",
+            title_x = 0.5,
+            template="plotly_white",
+            hovermode="x unified",  # track single x position
+            margin=dict(t=60, r=20, b=40, l=60),
+            legend=dict(itemsizing="constant"),
+        )
+
         return fig
 
     @output
@@ -1255,36 +1722,87 @@ def server(input, output, session):
         )
     
     @output
-    @render.plot
+    @render_widget
     @reactive.event(input.ind_go)
     def ind_car_plot():
         """
-        Plot Average CAR (cumulative mean log return across events for the
-        selected tickers) with a ±95% CI ribbon.
+        Interactive Average CAR (cumulative mean log return across events
+        for the selected tickers) with a ±95% CI ribbon.
         """
-        import matplotlib.pyplot as plt
-
         df = ind_panel()
-        fig, ax = plt.subplots()
+        fig = go.Figure()
+
         if df.empty:
-            ax.text(0.5, 0.5, "No events selected", ha="center")
+            fig.add_annotation(
+                text="No events selected",
+                x=0.5, y=0.5, xref="paper", yref="paper",
+                showarrow=False, font=dict(size=14)
+            )
+            fig.update_layout(template="plotly_white")
             return fig
 
-        g = df.groupby("rel_day")["logret"]
-        mu = g.mean().sort_index()                       # mean per rel_day
-        n = g.count().sort_index()                       # sample size per rel_day
+        g  = df.groupby("rel_day")["logret"]
+        mu = g.mean().sort_index()                                # mean per rel_day
+        n  = g.count().sort_index()                               # sample size
         se = g.std(ddof=1).sort_index() / np.sqrt(n.clip(lower=1))  # standard error
 
-        car = mu.cumsum()                                # cumulative mean
-        car_lo = (mu - 1.96 * se).cumsum()               # lower CI
-        car_hi = (mu + 1.96 * se).cumsum()               # upper CI
+        car    = mu.cumsum()                 # cumulative mean
+        car_lo = (mu - 1.96 * se).cumsum()   # lower CI
+        car_hi = (mu + 1.96 * se).cumsum()   # upper CI
+        xvals  = car.index.values
 
-        ax.plot(car.index, car.values)
-        ax.fill_between(car.index, car_lo.values, car_hi.values, alpha=0.2)
-        ax.axvline(0, linestyle="--")                    # mark event day
-        ax.set_xlabel("Relative day")
-        ax.set_ylabel("Avg CAR (selected tickers)")
-        ax.set_title("Average Cumulative Abnormal Return (Individual Stocks)")
+
+        # after you compute mu, n, se, car, car_lo, car_hi
+        xvals = car.index.astype(int)
+
+        fig = go.Figure()
+
+        # CI ribbon: add upper, then lower with fill='tonexty'
+        # CI ribbon
+        ci_rgba = "rgba(31, 119, 180, 0.20)"   # 20% opacity; tweak last number (0–1)
+
+        # upper bound (no visible line)
+        fig.add_trace(go.Scatter(
+            x=xvals, y=car_hi.values,
+            line=dict(width=0, color="rgba(0,0,0,0)"),
+            hoverinfo="skip", showlegend=False, name="CI hi"
+        ))
+
+        # lower bound + fill to previous
+        fig.add_trace(go.Scatter(
+            x=xvals, y=car_lo.values,
+            fill="tonexty",
+            fillcolor=ci_rgba,                  # <<< controls ribbon opacity
+            line=dict(width=0, color="rgba(0,0,0,0)"),
+            name="95% CI", showlegend=True, hoverinfo="skip"
+        ))
+
+        # main CAR line (with % shown in hover via customdata)
+        fig.add_trace(go.Scatter(
+            x=xvals, y=car.values, mode="lines", name="Avg CAR",
+            customdata=np.expm1(car.values),  # ≈ percent return
+            meta=n.values,                    # sample size at each rel_day
+            hovertemplate=(
+                "Day %{x}<br>"
+                "CAR (log): %{y:.4f}<br>"
+                "CAR (≈%): %{customdata:.2%}<br>"
+                "n: %{meta}<extra></extra>"
+            )
+        ))
+
+        # Event-day vertical line
+        fig.add_vline(x=0, line_dash="dash", line_color="black", opacity=0.6)
+
+        fig.update_layout(
+            title="Average Cumulative Abnormal Log Return (±95% CI)",
+            xaxis_title="Relative day",
+            yaxis_title="Avg CAR (selected tickers)",
+            title_x = 0.5,
+            template="plotly_white",
+            hovermode="x",
+            margin=dict(t=60, r=20, b=40, l=60),
+            legend=dict(itemsizing="constant"),
+        )
         return fig
     
     @output
@@ -1302,10 +1820,28 @@ def server(input, output, session):
         yield df.to_csv(index=False).encode()
 
     @output
-    @render.table
+    @render.data_frame
     def sec_desc_tbl():
         df = pd.read_csv(SEC_CSV)
-        return df
+        return render.DataTable(
+            df,
+            filters=True,       # column filters
+            selection_mode="row",
+            height="80vh",     # scroll if tall
+            width="100%"
+        )
+    
+    @output
+    @render.data_frame
+    def etfs_tbl():
+        df = pd.read_csv(ETF_CSV)
+        return render.DataTable(
+            df,
+            filters=True,       # column filters
+            selection_mode="row",
+            height="80vh",     # scroll if tall
+            width="100%"
+        )
 
 # Bundle UI + server into a Shiny app
 app = App(app_ui, server, static_assets=www_dir)
