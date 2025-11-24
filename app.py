@@ -1337,17 +1337,17 @@ def server(input, output, session):
         df["r"] = df["r"].clip(lower=-0.95, upper=0.95)
 
 
-        # ---- DIAGNOSTICS (after r computed) ----
-        if "Healthcare" in df["sector"].dropna().unique():
-            dfh = df.loc[df["sector"] == "Healthcare", ["date","ticker","r"]].copy()
-            bad_nonfinite = dfh.loc[~np.isfinite(dfh["r"])]
-            bad_big_pos  = dfh.loc[dfh["r"] > 1]
-            bad_big_neg  = dfh.loc[dfh["r"] < -0.95]
+        # # ---- DIAGNOSTICS (after r computed) ----
+        # if "Healthcare" in df["sector"].dropna().unique():
+        #     dfh = df.loc[df["sector"] == "Healthcare", ["date","ticker","r"]].copy()
+        #     bad_nonfinite = dfh.loc[~np.isfinite(dfh["r"])]
+        #     bad_big_pos  = dfh.loc[dfh["r"] > 1]
+        #     bad_big_neg  = dfh.loc[dfh["r"] < -0.95]
 
-            print("\n[DBG] Healthcare r describe:\n", dfh["r"].describe(), flush=True)
-            print("[DBG] Non-finite r rows:", len(bad_nonfinite), flush=True)
-            print("[DBG] r > 1 (top 10):\n", bad_big_pos.sort_values("r", ascending=False).head(10), flush=True)
-            print("[DBG] r < -0.95 (bottom 10):\n", bad_big_neg.sort_values("r", ascending=True).head(10), flush=True)
+        #     print("\n[DBG] Healthcare r describe:\n", dfh["r"].describe(), flush=True)
+        #     print("[DBG] Non-finite r rows:", len(bad_nonfinite), flush=True)
+        #     print("[DBG] r > 1 (top 10):\n", bad_big_pos.sort_values("r", ascending=False).head(10), flush=True)
+        #     print("[DBG] r < -0.95 (bottom 10):\n", bad_big_neg.sort_values("r", ascending=True).head(10), flush=True)
 
 
         # Option A: equal-weight within sector (average across tickers each day)
@@ -1369,12 +1369,13 @@ def server(input, output, session):
                   .fillna(0.0)
             )
 
-        if "Healthcare" in sec_daily.columns:
-            hc = sec_daily["Healthcare"]
-            print("[DBG] sec_daily Healthcare top 10 days:\n",
-                hc.sort_values(ascending=False).head(10), flush=True)
-            print("[DBG] sec_daily Healthcare bottom 10 days:\n",
-                hc.sort_values(ascending=True).head(10), flush=True)
+        # # The “sec_daily Healthcare top/bottom” block
+        # if "Healthcare" in sec_daily.columns:
+        #     hc = sec_daily["Healthcare"]
+        #     print("[DBG] sec_daily Healthcare top 10 days:\n",
+        #         hc.sort_values(ascending=False).head(10), flush=True)
+        #     print("[DBG] sec_daily Healthcare bottom 10 days:\n",
+        #         hc.sort_values(ascending=True).head(10), flush=True)
 
         # Build cumulative index for each sector (start at 1)
         sec_cum = (1.0 + sec_daily.fillna(0.0)).cumprod()
@@ -1382,13 +1383,13 @@ def server(input, output, session):
         # …and REBASE so the first row is exactly 1.0 for every sector.
         sec_cum = sec_cum.div(sec_cum.iloc[0].replace(0, np.nan), axis=1).fillna(1.0)
 
-        # ---- TEMP DEBUG (force-flush so you can see it) ----
-        if not sec_cum.empty:
-            print("\n[s_panel] sec_daily head:\n", sec_daily.head(3), flush=True)
-            print("[s_panel] sec_cum head:\n", sec_cum.head(3), flush=True)
-            print("[s_panel] first row of sec_cum:\n", sec_cum.iloc[0], flush=True)
-        # ---- END DEBUG ----
-        print(f"[s_panel] secs={secs}, eq={eq}, d0={d0.date()} d1={d1.date()}", flush=True)
+        # # ---- TEMP DEBUG (force-flush so you can see it) ----
+        # if not sec_cum.empty:
+        #     print("\n[s_panel] sec_daily head:\n", sec_daily.head(3), flush=True)
+        #     print("[s_panel] sec_cum head:\n", sec_cum.head(3), flush=True)
+        #     print("[s_panel] first row of sec_cum:\n", sec_cum.iloc[0], flush=True)
+        # # ---- END DEBUG ----
+        # print(f"[s_panel] secs={secs}, eq={eq}, d0={d0.date()} d1={d1.date()}", flush=True)
 
         return sec_cum
     
