@@ -1312,7 +1312,43 @@ def server(input, output, session):
         if df.empty:
             return pd.DataFrame()
 
-        df["r"] = _simple_returns(df["logret"])
+        # df["r"] = _simple_returns(df["logret"]) (DEPRICATED DUE TO ISSUES WITH HEALTHCARE SECTOR SPLIT-RELATED INDEX EXPLOSION)
+        df["r"] = _simple_returns(df["logret"]).astype("float64")
+        df["r"].replace([np.inf, -np.inf], np.nan, inplace=True)
+
+        # 1) Neutralize split days if you have flags
+        if {"is_split_day", "is_reverse_split_day"}.issubset(AE.columns):
+            # Map (date,ticker) → split flags, align, and null those returns
+            flags = (
+                AE.loc[:, ["date", "ticker", "is_split_day", "is_reverse_split_day"]]
+                .set_index(["date", "ticker"])
+            )
+            m = df.set_index(["date", "ticker"]).index
+            split_hits = flags.reindex(m).fillna(False).any(axis=1).to_numpy()
+            df.loc[split_hits, "r"] = np.nan
+
+        # 2) De-dup (date,ticker) before sector averaging
+        df = (
+            df.groupby(["date", "ticker", "sector"], as_index=False, observed=True)["r"]
+            .mean()
+        )
+
+        # 3) (Optional but practical) Winsorize extremes that slip through
+        df["r"] = df["r"].clip(lower=-0.95, upper=0.95)
+
+
+        # ---- DIAGNOSTICS (after r computed) ----
+        if "Healthcare" in df["sector"].dropna().unique():
+            dfh = df.loc[df["sector"] == "Healthcare", ["date","ticker","r"]].copy()
+            bad_nonfinite = dfh.loc[~np.isfinite(dfh["r"])]
+            bad_big_pos  = dfh.loc[dfh["r"] > 1]
+            bad_big_neg  = dfh.loc[dfh["r"] < -0.95]
+
+            print("\n[DBG] Healthcare r describe:\n", dfh["r"].describe(), flush=True)
+            print("[DBG] Non-finite r rows:", len(bad_nonfinite), flush=True)
+            print("[DBG] r > 1 (top 10):\n", bad_big_pos.sort_values("r", ascending=False).head(10), flush=True)
+            print("[DBG] r < -0.95 (bottom 10):\n", bad_big_neg.sort_values("r", ascending=True).head(10), flush=True)
+
 
         # Option A: equal-weight within sector (average across tickers each day)
         if eq:
@@ -1333,9 +1369,29 @@ def server(input, output, session):
                   .fillna(0.0)
             )
 
+        if "Healthcare" in sec_daily.columns:
+            hc = sec_daily["Healthcare"]
+            print("[DBG] sec_daily Healthcare top 10 days:\n",
+                hc.sort_values(ascending=False).head(10), flush=True)
+            print("[DBG] sec_daily Healthcare bottom 10 days:\n",
+                hc.sort_values(ascending=True).head(10), flush=True)
+
         # Build cumulative index for each sector (start at 1)
-        sec_cum = (1.0 + sec_daily).cumprod()
+        sec_cum = (1.0 + sec_daily.fillna(0.0)).cumprod()
+
+        # …and REBASE so the first row is exactly 1.0 for every sector.
+        sec_cum = sec_cum.div(sec_cum.iloc[0].replace(0, np.nan), axis=1).fillna(1.0)
+
+        # ---- TEMP DEBUG (force-flush so you can see it) ----
+        if not sec_cum.empty:
+            print("\n[s_panel] sec_daily head:\n", sec_daily.head(3), flush=True)
+            print("[s_panel] sec_cum head:\n", sec_cum.head(3), flush=True)
+            print("[s_panel] first row of sec_cum:\n", sec_cum.iloc[0], flush=True)
+        # ---- END DEBUG ----
+        print(f"[s_panel] secs={secs}, eq={eq}, d0={d0.date()} d1={d1.date()}", flush=True)
+
         return sec_cum
+    
 
     @output
     @render.text
@@ -1360,29 +1416,28 @@ def server(input, output, session):
                 x=0.5, y=0.5, xref="paper", yref="paper",
                 showarrow=False, font=dict(size=14)
             )
-            fig.update_layout(template="plotly_white")
+            fig.update_layout(template="plotly_white", title_x=0.5)
             return fig
-
-        # one line per sector
+        
+        # One line per sector
         for c in df.columns:
             fig.add_trace(
                 go.Scatter(
                     x=df.index, y=df[c],
-                    mode="lines",
-                    name=c,
-                    hovertemplate="%{x|%Y-%m-%d}<br>Index: %{y:.3f}<extra></extra>",
+                    mode="lines", name=c,
+                    hovertemplate="%{x|%Y-%m-%d}<br>Index: %{y:.3f}x<extra></extra>",
                 )
             )
 
         fig.update_layout(
             title="Sector Cumulative Indices (start = 1)",
-            xaxis_title="Date",
-            yaxis_title="Index",
-            title_x = 0.5,
+            title_x=0.5,
             template="plotly_white",
             hovermode="x unified",
-            legend_title_text="Sector",
+            xaxis_title="Date",
+            yaxis_title="Index (start = 1x)",
             margin=dict(t=60, r=20, b=40, l=60),
+            legend_title_text="Sector",
         )
         return fig
 
@@ -1393,9 +1448,12 @@ def server(input, output, session):
         df = s_panel()
         if df.empty:
             return pd.DataFrame()
-        # Last point per sector
         last = df.tail(1).T.reset_index()
         last.columns = ["Sector", "Cumulative return index (start = 1)"]
+        last["Total return"] = last["Cumulative return index (start = 1)"] - 1.0
+        # nice rounding for display
+        last["Cumulative return index (start = 1)"] = last["Cumulative return index (start = 1)"].round(3)
+        last["Total return"] = (last["Total return"] * 100).round(2).astype(str) + "%"
         return last
 
     @output
@@ -1404,6 +1462,7 @@ def server(input, output, session):
     def s_dl():
         df = s_panel()
         yield (df.reset_index().rename(columns={"index": "date"}).to_csv(index=False).encode())
+
 
     # ─────────────────────────────────────────────────────────────────────────
     # 1) EVENT STUDY
