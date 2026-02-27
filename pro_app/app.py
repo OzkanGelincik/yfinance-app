@@ -1,5 +1,5 @@
 """
-app.py — Event Study Studio (pandas-only)
+app.py — Event Study Studio (DuckDB + S3)
 -----------------------------------------
 Run with:
     cd /path/to/your/project
@@ -22,11 +22,12 @@ from datetime import date
 import numpy as np
 import pandas as pd
 from shiny import App, ui, render, reactive
-from shiny.ui import tags
 from shinywidgets import output_widget, render_widget   # <-- add this
 # (In the UI we’ll use ui.output_widget(...))
 import plotly.graph_objects as go
 import plotly.express as px
+import duckdb
+import os 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║  Locate & load dataset                                                   ║
@@ -41,203 +42,137 @@ SEC_CSV = OUT_DIR / "sec_filing_descriptions.csv"
 
 ETF_CSV = OUT_DIR / "top_100_etfs_described.csv"
 
+TICKERS_CSV = OUT_DIR / "tickers.csv"
+
 www_dir = Path(__file__).parent / "www"
 
-# Accept any of these filenames; first one found wins.
-CANDIDATES = [
-    "sample_backfilled_v7_1y_9col.parquet", # allow a tiny demo file
-    "analysis_enriched_backfilled_v7.parquet",
-]
+SEC_DESC_DF = pd.read_csv(SEC_CSV)
 
-# Find the first candidate that exists under outputs/
-DATA_PQ = None
-for name in CANDIDATES:
-    p = APP_DIR / "outputs" / name
-    if p.exists():
-        DATA_PQ = p
-        break
-if DATA_PQ is None:
-    raise FileNotFoundError(
-        f"Could not find any of {CANDIDATES} in {APP_DIR/'outputs'}"
+ETF_DF      = pd.read_csv(ETF_CSV)
+
+
+
+def _load_ticker_universe(path: Path) -> list[str]:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Missing {path}. Create it once (distinct tickers) and place it in outputs/."
+        )
+    df = pd.read_csv(path)
+    # Accept either column name "ticker" or first column
+    col = "ticker" if "ticker" in df.columns else df.columns[0]
+    tickers = (
+        df[col]
+        .astype(str)
+        .str.upper()
+        .str.strip()
+        .replace("", np.nan)
+        .dropna()
+        .unique()
+        .tolist()
     )
+    tickers.sort()
+    return tickers
 
-# 1) DEFINE ONLY THE COLUMNS WE NEED
-# This prevents loading 'open', 'high', 'low', 'volume', 'cik', etc. into RAM
-cols_to_keep = [
-    "date", "ticker", "close", "logret", "sector", 
-    "filing_form", "is_split_day", "is_reverse_split_day"
-]
+TICKER_UNIVERSE = _load_ticker_universe(TICKERS_CSV)
 
-# 2) LOAD DATA WITH OPTIMIZATIONS
-AE = pd.read_parquet(DATA_PQ, columns=cols_to_keep)
 
-# print(AE.sample(50))
 
-# 3) OPTIMIZE MEMORY USAGE IMMEDIATELY
-# Convert 'ticker' and 'sector' to category.
-# (Strings take huge RAM; Categories map strings to tiny integers)
-AE["ticker"] = AE["ticker"].astype("category")
-AE["sector"] = AE["sector"].astype("category")
+# Optional: load local env vars for dev (DO NOT commit .env)
+# pip install python-dotenv
+try:
+    from dotenv import load_dotenv
+    load_dotenv(APP_DIR / ".env", override=False)
+except Exception:
+    pass
 
-# Downcast floats to float32 (halves memory usage for numbers)
-f_cols = AE.select_dtypes(include=['float64']).columns
-AE[f_cols] = AE[f_cols].astype("float32")
 
-# ── Normalize core columns (prevents a lot of downstream headaches) ─────────
-# 1) date → pandas datetime (NaT on bad values), drop timezone, keep only the day
-AE["date"] = (
-    pd.to_datetime(AE["date"], errors="coerce")
-      .dt.tz_localize(None)
-      .dt.normalize()
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  DuckDB + S3 hookup                                                      ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+S3_URI = os.getenv(
+    "AE_S3_URI",
+    "s3://yfinance-app-data/yfinance-app/analysis_enriched_backfilled_v7_3y_11col_tidx_year.parquet",
 )
 
-# 2) ticker → Ensure consistency (Category handles this better, but if you need uppercase string logic:)
-# Note: Since we used category above, we verify they are upper. 
-# If your parquet tickers are already uppercase, you can skip this.
-# If you must force upper, do it before converting to category to save RAM:
-# (Here we assume they are reasonably clean, or we process them as categories)
+def _configure_duckdb_s3(con: duckdb.DuckDBPyConnection) -> None:
+    """
+    Safe S3 credential loading for DuckDB.
 
-# 2) ticker → uppercase strings (consistent joins/filters)
-# AE["ticker"] = AE["ticker"].astype(str).str.upper()
+    Order:
+      1) DuckDB aws credential chain (reads AWS env vars, ~/.aws/*, IAM role/web identity, etc.)
+      2) Explicit env var fallback (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN)
 
-# 3) Sort (Sorting is expensive! doing it after dropping columns is faster)
-AE = AE.sort_values(["ticker", "date"]).reset_index(drop=True)
+    Nothing is hardcoded. Nothing is written to disk.
+    """
+    # Extensions (INSTALL is optional if already available in your environment)
+    def _safe_install_load(con, ext: str):
+        try:
+            con.execute(f"INSTALL {ext};")
+        except Exception:
+            pass
+        con.execute(f"LOAD {ext};")
 
-# 4) Trading-day index per ticker:
-#    For each ticker, 0,1,2,... in chronological order (ignores real calendar gaps)
-AE["tidx"] = AE.groupby("ticker").cumcount()
+    _safe_install_load(con, "httpfs")
+    _safe_install_load(con, "aws")
 
-# 5) Ensure log returns exist (if not, compute from 'close')
-if "logret" not in AE.columns and "close" in AE.columns:
-    AE["close"] = pd.to_numeric(AE["close"], errors="coerce")
-    # logret_t = ln(close_t / close_{t-1}) calculated per ticker
-    AE["logret"] = (
-        AE.groupby("ticker")["close"]
-          .apply(lambda s: np.log(s / s.shift(1)))
-          .reset_index(level=0, drop=True)
-          .astype("float32") # Keep it small
+    # Region can come from env; default is fine for your bucket
+    aws_region = os.getenv("AWS_REGION", "us-east-1")
+    con.execute(f"SET s3_region='{aws_region}';")
+
+    # Prefer DuckDB's AWS credential chain (recommended)
+    # This will pick up (in order, broadly): env vars, shared config/credentials files, IAM role, web identity, etc.
+    try:
+        con.execute("CALL load_aws_credentials();")
+        return
+    except Exception:
+        # Fall through to explicit env var config if you supplied them
+        pass
+
+    # Fallback: explicit env vars (still safe, because they are not committed)
+    access_key = os.getenv("AWS_ACCESS_KEY_ID")
+    secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+    session_token = os.getenv("AWS_SESSION_TOKEN")  # optional (for STS)
+
+    if access_key and secret_key:
+        def _q(s: str) -> str:
+            return s.replace("'", "''")
+
+        con.execute(f"SET s3_access_key_id='{_q(access_key)}';")
+        con.execute(f"SET s3_secret_access_key='{_q(secret_key)}';")
+        if session_token:
+            con.execute(f"SET s3_session_token='{_q(session_token)}';")
+        return
+
+    # If we got here, there are no usable credentials
+    raise RuntimeError(
+        "No AWS credentials found. Provide credentials via one of these safe methods:\n"
+        "  - AWS default credential chain (recommended): AWS_PROFILE / ~/.aws/credentials / IAM role\n"
+        "  - Or env vars: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (optional AWS_SESSION_TOKEN)\n"
     )
 
-# NOTE: Deprecated helper. Event Study now uses the long EVENTS table
-# (build_events_long) and no longer relies on AE["form"].
-# If you need quick inline tagging for ad-hoc inspection, you can re-enable this.
-# AE["form"] = ...
 
-# ── Build a unified 'form' column: filing form OR split label ───────────────
-# Use object dtype to avoid NumPy "dtype promotion" issues when mixing strings/NaN
-# AE["form"] = (
-#     AE["filing_form"].astype("object")
-#     if "filing_form" in AE.columns
-#     else pd.Series([None] * len(AE), index=AE.index, dtype="object")
-# )
+def _duckdb_connect() -> duckdb.DuckDBPyConnection:
+    con = duckdb.connect(database=":memory:")
+    _configure_duckdb_s3(con)
+    return con
 
-# Safe boolean masks even if columns are missing; fillna(False) to avoid NaNs in logic
-# rev = (
-#     AE["is_reverse_split_day"].fillna(False)
-#     if "is_reverse_split_day" in AE.columns
-#     else pd.Series(False, index=AE.index)
-# )
-# fwd = (
-#     AE["is_split_day"].fillna(False)
-#     if "is_split_day" in AE.columns
-#     else pd.Series(False, index=AE.index)
-# )
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  Helpers used by server/plots                                             ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
 
-# Only fill split labels where no filing form exists (don’t overwrite true forms)
-# AE.loc[AE["form"].isna() & rev, "form"] = "REVERSE_SPLIT"
-# AE.loc[AE["form"].isna() & fwd, "form"] = "SPLIT"
-
-# ---- Helpers for returns & shapes ----
 def _simple_returns(logret: pd.Series) -> pd.Series:
-    """Convert log returns to simple returns; fill NaNs with 0 (flat)."""
     return np.expm1(logret.fillna(0.0))
 
-def _dater_default(df: pd.DataFrame, days_back: int = 252):
-    """Default date range: last ~1Y of data (trading days)."""
-    hi = pd.to_datetime(df["date"].max())
-    lo = max(pd.to_datetime(df["date"].min()), hi - pd.Timedelta(days=days_back))
-    return str(lo.date()), str(hi.date())
-    
-# ── Build a proper long "EVENTS" table (one row per distinct event) ─────────    
-def build_events_long(AE: pd.DataFrame) -> pd.DataFrame:
-    parts = []
-
-    # Filing events
-    if "filing_form" in AE.columns:
-        f = AE.loc[AE["filing_form"].notna(), ["ticker", "date", "filing_form"]].copy()
-        f = f.rename(columns={"filing_form": "event_type"})
-        parts.append(f)
-
-    # Split events
-    if "is_split_day" in AE.columns:
-        s = AE.loc[AE["is_split_day"] == True, ["ticker", "date"]].copy()
-        s["event_type"] = "SPLIT"
-        parts.append(s)
-
-    if "is_reverse_split_day" in AE.columns:
-        r = AE.loc[AE["is_reverse_split_day"] == True, ["ticker", "date"]].copy()
-        r["event_type"] = "REVERSE_SPLIT"
-        parts.append(r)
-
-    if not parts:
-        ev = pd.DataFrame(columns=["ticker", "date", "event_type"])
-    else:
-        ev = pd.concat(parts, ignore_index=True).drop_duplicates()
-
-    # Attach sector if present (use a minimal deduped slice)
-    if "sector" in AE.columns:
-        ev = ev.merge(
-            AE.loc[:, ["ticker", "date", "sector"]].drop_duplicates(),
-            on=["ticker", "date"],
-            how="left",
-        )
-
-    # Flag same-day overlaps per ticker
-    counts = ev.groupby(["ticker", "date"], observed=True).size().rename("n_events")
-    ev = ev.merge(counts, on=["ticker", "date"], how="left")
-    ev["is_overlap"] = ev["n_events"] > 1
-
-    # Ensure proper dtypes
-    ev["date"] = pd.to_datetime(ev["date"]).dt.normalize()
-    ev["ticker"] = ev["ticker"].astype(str).str.upper()
-    return ev
-
-EVENTS = build_events_long(AE)
-
-# ── Choices for the UI ──────────────────────────────────────────────────────
-# ── Choices for the UI (as you already had) ──
-# Replace empty strings (and pure-whitespace strings) with NaN
-AE["sector"] = AE["sector"].replace("", np.nan)
-AE["sector"] = AE["sector"].where(AE["sector"].astype(str).str.strip() != "", np.nan)
-
-sector_choices = (
-    sorted(AE["sector"].dropna().unique().tolist())
-    if "sector" in AE.columns else []
-)
-
-event_types = sorted(EVENTS["event_type"].dropna().unique().tolist())
-
-# This "forms" is depricated as I built a more comprehensive approach to studying the filings, split, and reverse split events. 
-# Ignore this "forms" unless you activate the previous approach that's commented out above.
-# forms = [
-#     "10-Q", "10-K", "8-K", "S-1", "S-1/A", "DRS", "DRS/A", "UPLOAD",
-#     "SC 13G", "SC 13G/A", "SPLIT", "REVERSE_SPLIT",
-# ]
-ticker_choices = sorted(AE["ticker"].dropna().unique().tolist())
-dlo, dhi = _dater_default(AE, 252)
-
-# Add a tiny color-map helper (top of file, near other helpers)
+# Plotly helpers: KEEP THESE
 def _build_color_map(labels):
-    """Stable ticker→color map (same color for a ticker across all pies)."""
     palette = (px.colors.qualitative.D3
                + px.colors.qualitative.Set2
                + px.colors.qualitative.Plotly)
     labs = sorted(pd.Index(labels).unique())
     return {lab: palette[i % len(palette)] for i, lab in enumerate(labs)}
 
-# Update your pie factory to accept the map and enforce order
 def _pie_fig(*, names, values, title, hole=0.35, unit=None, percent=True, color_map=None):
-    # if a color_map is given, reindex to that order to keep legend/slice order stable
     ser = pd.Series(values, index=pd.Index(names, name="ticker"))
     if color_map:
         ordered = [t for t in color_map.keys() if t in ser.index]
@@ -248,11 +183,10 @@ def _pie_fig(*, names, values, title, hole=0.35, unit=None, percent=True, color_
         values=ser.values,
         hole=hole,
         title=title,
-        color=ser.index,                       # color by ticker
-        color_discrete_map=color_map or {},    # enforce our mapping
+        color=ser.index,
+        color_discrete_map=color_map or {},
     )
 
-    # hover text
     if unit == "currency":
         ht = "%{label}: $%{value:,.0f}"
     elif unit == "shares":
@@ -261,10 +195,91 @@ def _pie_fig(*, names, values, title, hole=0.35, unit=None, percent=True, color_
         ht = "%{label}: %{value}"
     if percent:
         ht += " (%{percent})"
-    fig.update_traces(hovertemplate=ht + "<extra></extra>", textinfo="percent")
+
+    textinfo = "percent" if percent else "none"
+    fig.update_traces(hovertemplate=ht + "<extra></extra>", textinfo=textinfo)
 
     fig.update_layout(margin=dict(l=10, r=10, t=50, b=10), title_x=0.5, legend_title_text="Ticker")
     return fig
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  UI choices (computed once, tiny queries)                                 ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+con = _duckdb_connect()
+
+try:
+    def _ddb_quote_string(s: str) -> str:
+        # DuckDB uses single quotes for string literals
+        return "'" + s.replace("\\", "\\\\").replace("'", "''") + "'"
+
+    con.execute(f"CREATE OR REPLACE VIEW ae AS SELECT * FROM read_parquet({_ddb_quote_string(S3_URI)});")
+
+    con.execute("""
+    CREATE OR REPLACE VIEW events AS
+    WITH filing AS (
+      SELECT DISTINCT UPPER(ticker) AS ticker, date::DATE AS date, filing_form AS event_type, sector
+      FROM ae
+      WHERE filing_form IS NOT NULL
+    ),
+    splits AS (
+      SELECT DISTINCT UPPER(ticker) AS ticker, date::DATE AS date, 'SPLIT' AS event_type, sector
+      FROM ae
+      WHERE is_split_day = TRUE
+    ),
+    rsplits AS (
+      SELECT DISTINCT UPPER(ticker) AS ticker, date::DATE AS date, 'REVERSE_SPLIT' AS event_type, sector
+      FROM ae
+      WHERE is_reverse_split_day = TRUE
+    ),
+    all_events AS (
+      SELECT * FROM filing
+      UNION ALL SELECT * FROM splits
+      UNION ALL SELECT * FROM rsplits
+    ),
+    counts AS (
+      SELECT ticker, date, COUNT(*) AS n_events
+      FROM all_events
+      GROUP BY 1,2
+    )
+    SELECT e.*, c.n_events, (c.n_events > 1) AS is_overlap
+    FROM all_events e
+    JOIN counts c USING (ticker, date);
+    """)
+
+    def ddb_df(sql: str, params=None) -> pd.DataFrame:
+        return con.execute(sql, params or []).df()
+
+    sector_choices = ddb_df("""
+        SELECT DISTINCT TRIM(sector) AS sector
+        FROM ae
+        WHERE sector IS NOT NULL AND TRIM(sector) <> ''
+        ORDER BY sector;
+    """)["sector"].tolist()
+
+    event_types = ddb_df("""
+        SELECT DISTINCT event_type
+        FROM events
+        ORDER BY event_type;
+    """)["event_type"].tolist()
+
+    bounds = ddb_df("SELECT MIN(date::DATE) AS min_date, MAX(date::DATE) AS max_date FROM ae;").iloc[0]
+    hi = pd.to_datetime(bounds["max_date"]).normalize()
+    lo = max(pd.to_datetime(bounds["min_date"]).normalize(), hi - pd.Timedelta(days=756))
+    dlo, dhi = str(lo.date()), str(hi.date())
+
+
+    # After: dlo, dhi = str(lo.date()), str(hi.date())
+
+    def _fmt_mdy(iso_yyyy_mm_dd: str) -> str:
+        d = pd.to_datetime(iso_yyyy_mm_dd).date()
+        return f"{d.month}/{d.day}/{d.year}"
+
+    DATA_AVAIL_TEXT = f"Data available: {_fmt_mdy(dlo)} to {_fmt_mdy(dhi)}"
+
+finally:
+    con.close()
+
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -429,7 +444,8 @@ Select filing/split types, a window (±k trading days), and optional sector filt
     - `yahoo_fin` (NASDAQ/NYSE ticker lists)
     - `yahooquery` (market cap, sector, industry)  
   - SEC EDGAR API (submissions + companyfacts JSON (`/api/xbrl/companyfacts/CIK{cik}.json`) via `requests`) for CIK/SIC, filings, shares/public float
-- **Caching/IO** - Parquet for fast reloads; local JSON cache for SEC responses; CSV export from the app. *No DuckDB used.*
+- **Caching/IO** - Parquet for fast reloads; local JSON cache for SEC responses; CSV export from the app.
+- **DuckDB (query engine) + S3 Parquet (storage), pandas for transforms, Plotly for charts.**
 
 ## **Data & caveats** 
 - Educational use only — **not financial advice**.  
@@ -524,45 +540,97 @@ We identified that 77 of the top 100 ETFs were missing. We successfully download
 * **Final Master File:** `analysis_enriched_backfilled_v7.parquet`
 * **Key Stats:** 100% Sector Coverage, 100% Top ETF Coverage, Validated "True Negative" missing data.
 
-#### **Step 10: Subset Data for Shiny App**
-The final dataset used in this app is a lightweight subset of the meta file `v7`. It is a 1.2M+ row DataFrame saved as `sample.parquet` with only the columns needed for the app: `date`, `ticker`, `close`, `logret`, `filing_form`, `sector`, `is_split_day`, `is_reverse_split_day`, and `market_cap`. For practical reasons, only the last year of data (approx. 2024-09-30 to 2025-09-30) was kept.
-* **Final File:** `sample.parquet`
+
+#### **Step 10: Build the “Pro” thin dataset for the Shiny app (from v7)**
+The legacy app loaded a large Parquet dataset into pandas at startup, which limited how much history we could ship and often caused deployment memory failures.  
+For the **pro** app, we generate a **thin, app-optimized Parquet** derived from the full v7 meta dataset and host it on **Amazon S3**. The app then uses **DuckDB** to query only the rows and columns needed for each user action (portfolio, sectors, event windows), instead of loading everything into memory.
+
+- **Source (meta):** `analysis_enriched_backfilled_v7.parquet` (wide schema, full enrichment)
+- **Output (pro thin):** `analysis_enriched_backfilled_v7_3y_11col_tidx_year.parquet` (thin schema, app-ready)
+- **Storage:** Amazon S3 (Parquet)
+- **Runtime access:** DuckDB `read_parquet(...)` directly against S3 (no full dataset download into app memory)
+- **Config:** S3 object is controlled by `AE_S3_URI` (env var). A default URI is provided for convenience.
+
+#### **Step 10A: Filter the row scope to a multi-year window**
+We restrict the dataset to a **recent multi-year window** (about the last ~3 years) to keep the pro app responsive while still supporting:
+- longer backtests (useful for checking seasonality patterns)
+- more event observations (more robust event study statistics)
+
+- **Window:** ~3 years of daily rows per ticker (where price history exists)
+- **Why:** more history than the legacy app, without shipping a heavy dataset into memory
+
+#### **Step 10B: Keep only the columns required by the pro app**
+The pro dataset keeps a minimal schema that supports all three Shiny workflows while staying lightweight for cloud reads.
+
+**Columns kept (pro thin schema):**
+- `date` (trading date)
+- `ticker` (uppercased symbol)
+- `close` (price used in app displays and weighting logic)
+- `logret` (log daily return. Converted to simple returns in Portfolio/Sector. Used directly in Event Study)
+- `filing_form` (SEC filing event label for event selection)
+- `sector` (sector filters and sector indexing)
+- `is_split_day` (forward split event flag)
+- `is_reverse_split_day` (reverse split event flag)
+- `market_cap` (optional summaries/filters where relevant)
+- `tidx` (per-ticker trading-day index for fast ±k event windows)
+- `year` (precomputed helper for fast filtering/grouping and to avoid repeated date parsing)
+
+#### **Step 10C: Add trading-day indexing for fast and correct event windows**
+To construct true **±k trading-day** windows (ignoring weekends and market holidays), we add:
+
+- `tidx = 0, 1, 2, ...` within each ticker’s trading calendar
+
+Event windows are built by joining on `tidx` offsets (e.g., `event_tidx + rel_day`), which avoids expensive calendar logic and keeps event window construction fast in DuckDB.
+
+#### **Step 10D: Host the thin dataset on S3 and query it at runtime**
+The final thin dataset is stored in S3 and queried directly by DuckDB during app usage.
+
+**Final File (pro thin dataset):**
+- `analysis_enriched_backfilled_v7_3y_11col_tidx_year.parquet`
 
 ---
 
-#### **Meta Data Dictionary**
+## **Pro thin dataset dictionary (what the deployed app actually queries)**
 
 | Variable | dtype | Description |
 | :--- | :--- | :--- |
-| `date` | `datetime64[ns]` | Trading date, normalized to midnight (YYYY-MM-DD), no timezone. One row per ticker per trading day. |
-| `ticker` | `object` (`string`) | Stock symbol (uppercased). Primary identifier along with date. |
-| `open` | `float` | Opening price for the trading day. |
-| `high` | `float` | Highest price traded during the day. |
-| `low` | `float` | Lowest price traded during the day. |
-| `close` | `float` | Closing price for the day. Main price used for returns. |
-| `adj_close` | `float` | Adjusted close price (accounts for splits and sometimes dividends), as provided by yfinance. |
-| `volume` | `float` / `int` | Number of shares traded on that day. |
-| `ret` | `float` | Simple daily return: roughly close_t / close_{t-1} - 1. Intuitive: 0.05 = +5%. |
-| `logret` | `float` | Log daily return: log(close_t / close_{t-1}). Adds nicely over time; used in event study & app. |
-| `market_cap` | `float` | Approximate market capitalization on that date (close * shares_outstanding), if available. |
-| `sector` | `object` | Sector classification (e.g., Healthcare, Financial Services). Often missing for microcaps / obscure tickers. |
-| `industry` | `object` | More granular industry classification, if available. |
-| `cik` | `object` / `int`-like | SEC CIK (Central Index Key) for the issuer, used to link filings to the company. |
-| `sic` | `object` / `int`-like | Standard Industrial Classification code (numeric). |
-| `sic_desc` | `object` | Text description of the SIC code (e.g., "HOSPITALS", "CRUDE PETROLEUM & NATURAL GAS"). |
-| `recent_form` | `object` | Most recent filing form (e.g., 10-K, 10-Q) as a snapshot from SEC submissions API. |
-| `recent_filing_date` | `datetime64[ns]` | Date of the most recent filing (snapshot, not time-varying). |
-| `shares_outstanding` | `float` | Number of shares outstanding as of this date. Used with close to compute market cap. |
-| `float_shares` | `float` | Float shares (freely tradable shares, excluding locked-up or tightly held ones), if available. |
-| `free_float` | `float` | Free float ratio, typically float_shares / shares_outstanding. Between 0 and 1 (e.g. 0.35 = 35% free float). |
-| `filing_form` | `object` | Filing form on this exact date for this ticker (e.g. 10-Q, 8-K, S-1, SC 13G/A). NaN on non-filing days. This is your "event-day" form. |
-| `last_filing_date` | `datetime64[ns]` | Date of the latest filing on or before this date. Similar to `recent_filing_date`; exact logic may differ slightly in the notebook. |
-| `is_filing_day` | `bool` | True if a filing occurs on this date for this ticker (i.e. there is a `filing_form` that day). |
-| `days_since_filing` | `int` | Number of calendar days since the last filing (`date - last_filing_date` in days). If no prior filing exists, often NaN or a sentinel. |
-| `split_ratio` | `float` | Split ratio if there's a split event on this date (e.g. 2.0 = 2-for-1, 0.2 = 1-for-5 reverse split). |
-| `is_split_day` | `bool` | True on forward split dates (share count increases, price drops). |
-| `is_reverse_split_day` | `bool` | True on reverse split dates (share count decreases, price jumps). |
-| `split_cum_factor` | `float` | Cumulative split adjustment factor up to this date. Starts at 1.0, multiplies by each split_ratio. |
+| `date` | date / datetime | Trading date (YYYY-MM-DD). |
+| `ticker` | string | Stock symbol (uppercased). |
+| `close` | float | Close price used for portfolio weighting and displays. |
+| `logret` | float | Log daily return. Used directly in Event Study; converted to simple returns in other panels. |
+| `market_cap` | float | Approximate market cap (may be missing for some tickers). |
+| `sector` | string | Sector classification used for filtering and sector indexing. |
+| `filing_form` | string | SEC filing form on that date (event label). Null on non-filing days. |
+| `is_split_day` | bool | True on forward split dates. |
+| `is_reverse_split_day` | bool | True on reverse split dates. |
+| `tidx` | int | Per-ticker trading-day index used to build ±k trading-day windows. |
+| `year` | int | Calendar year derived from `date` for fast filtering/grouping. |
+
+---
+
+## **v7 meta dataset dictionary (reference, not loaded by the pro app)**
+The full v7 dataset contains additional fields used during enrichment and validation (e.g., OHLCV, identifiers, share history, SIC metadata). The pro app does not load this wide table at runtime.
+
+| Variable | dtype | Description |
+| :--- | :--- | :--- |
+| `open` | float | Opening price for the trading day. |
+| `high` | float | Highest price traded during the day. |
+| `low` | float | Lowest price traded during the day. |
+| `adj_close` | float | Adjusted close price (accounts for splits and sometimes dividends). |
+| `volume` | float / int | Number of shares traded on that day. |
+| `ret` | float | Simple daily return. |
+| `industry` | string | More granular industry classification. |
+| `cik` | string / int-like | SEC CIK identifier. |
+| `sic` | string / int-like | SIC code. |
+| `sic_desc` | string | SIC description. |
+| `shares_outstanding` | float | Shares outstanding (time-varying where available). |
+| `float_shares` | float | Float shares (time-varying where available). |
+| `free_float` | float | Float ratio. |
+| `split_ratio` | float | Split ratio for split events. |
+| `split_cum_factor` | float | Cumulative split adjustment factor. |
+| `last_filing_date` | date | Last filing date on or before the row’s date. |
+| `is_filing_day` | bool | True on filing dates. |
+| `days_since_filing` | int | Days since last filing. |
 """
 
 appendix_markdown = r"""
@@ -679,12 +747,12 @@ How the ETF tracks its index:
 `Region/Style: ~% Top Sector 1, ~% Top Sector 2...`
     - Example:  
     *"US Large Cap: ~31% Tech, ~14% Fin..."* means the fund invests in big US companies, and its performance is most heavily influenced by Technology (31%) and Financials (14%).
-
+<br><br>
 - **Bonds (Fixed Income):**  
 `Credit Quality/Type: ~% Breakdown by Issuer Type`
     - Example:  
     *"US Inv Grade Bonds: ~43% Treasuries..."* means the fund holds safe US debt, split between Government bonds (Treacheries) and other types.
-
+<br><br>
 - **Commodities/Alternative:**  
 `Type: 100% Underlying Asset`
     - Example:  
@@ -693,7 +761,6 @@ How the ETF tracks its index:
 #### **2. Abbreviations Key**
 
 - **Sectors (What industry the companies are in)**
-
     - **Tech:** Information Technology (e.g., Apple, Microsoft, Nvidia)  
     - **Fin:** Financials (e.g., Chase, Visa, Berkshire Hathaway)  
     - **Health:** Healthcare (e.g., UnitedHealth, Eli Lilly)  
@@ -702,18 +769,16 @@ How the ETF tracks its index:
     - **Ind:** Industrials (e.g., Caterpillar, GE, Aerospace)  
     - **Cons Staples:** Consumer Staples (essential goods like P&G, Walmart, Coke)  
     - **Real Estate / REITs:** Real Estate Investment Trusts  
-
+<br><br>
 - **Bond Types**
-
     - **Treasuries:** Debt issued by the US Government (safest).  
     - **MBS:** Mortgage-Backed Securities (pools of home loans, usually agency-backed).  
     - **Corporates:** Debt issued by companies.  
     - **Inv Grade:** Investment Grade (high credit quality, lower risk).  
     - **High Yield / Junk:** Non-investment grade (lower credit quality, higher risk/yield).  
     - **Muni:** Municipal Bonds (issued by states/cities, often tax-exempt).  
-
-- **Regions
-
+<br><br>
+- **Regions**
     - **Dev Markets:** Developed Markets (advanced economies like UK, Japan, France, Canada).  
     - **Emerging Markets:** Developing economies (China, India, Brazil, Taiwan).  
 
@@ -752,16 +817,10 @@ You will see the tilde symbol (`~`) before percentage numbers. This indicates an
 
 '''
 
-# This is the main UI definition you can use in your nav_panel
-dataset_build_ui = ui.div(
-    ui.markdown(dataset_build_markdown),
-    # Add some padding for better readability
-    {"style": "padding: 2rem;"}
-)
 
 app_ui = ui.page_fluid(
     head_links,
-    ui.h2("Portfolio, Sector & Event Lab", class_="fw-bold"),
+    ui.h2("Portfolio, Sector & Event Lab Pro", class_="fw-bold"),
     ui.p("Build buy-and-hold backtests, benchmark sectors, and quantify reactions to news."),
     ui.navset_tab(
 
@@ -840,7 +899,7 @@ app_ui = ui.page_fluid(
             ui.div(     
                 ui.markdown(dataset_build_markdown),
                 # Add some padding for better readability
-                {"style": "padding: 2rem;"}
+                style= "padding: 2rem;",
             ),
         ),
 
@@ -850,10 +909,14 @@ app_ui = ui.page_fluid(
             "Portfolio Simulator",
             ui.layout_sidebar(
                 ui.sidebar(
-                    ui.input_selectize("p_tickers", "Pick tickers (1–10)", ticker_choices, multiple=True),
+                    ui.input_text("p_ticker_search", "Search tickers", placeholder="Type e.g. aa, nv, msft"), # this line replaced `ui.input_selectize("p_tickers", ..., ticker_choices, multiple=True)`
+                    ui.input_selectize("p_matches", "Matches", choices=[], multiple=False), # this line replaced `ui.input_selectize("p_tickers", ..., ticker_choices, multiple=True)`
+                    ui.input_action_button("p_add", "Add ticker"), # this line replaced `ui.input_selectize("p_tickers", ..., ticker_choices, multiple=True)`
+                    ui.input_action_button("p_clear", "Clear tickers"), # this line replaced `ui.input_selectize("p_tickers", ..., ticker_choices, multiple=True)`
+                    ui.output_text("p_selected"), # this line replaced `ui.input_selectize("p_tickers", ..., ticker_choices, multiple=True)`
                     ui.input_numeric("p_cash", "Initial cash ($)", value=10_000, min=100),
                     ui.input_checkbox("p_equal", "Equal-weight portfolio?", value=True),
-                    ui.input_date_range("p_dater", "Backtest range (Data available: 9/30/2024-9/30/2025)", start=dlo, end=dhi),
+                    ui.input_date_range("p_dater", f"Backtest range ({DATA_AVAIL_TEXT})", start=dlo, end=dhi, min = dlo, max = dhi),
                     ui.input_action_button("p_go", "Simulate"),
                     ui.hr(),
                     ui.help_text("Uses simple returns derived from log returns. Buy once and hold; equal-weight at start if checked and inverse-price static weight if unchecked."),
@@ -884,7 +947,7 @@ app_ui = ui.page_fluid(
                 ui.sidebar(
                     ui.input_checkbox_group("s_sectors", "Sectors", sector_choices, inline=False),
                     ui.input_checkbox("s_equal", "Equal-weight within sector", value=True),
-                    ui.input_date_range("s_dater", "Backtest range (Data available: 9/30/2024-9/30/2025)", start=dlo, end=dhi),
+                    ui.input_date_range("s_dater", f"Backtest range ({DATA_AVAIL_TEXT})", start=dlo, end=dhi, min = dlo, max = dhi),
                     ui.input_action_button("s_go", "Build sector indices"),
                     ui.hr(),
                     ui.help_text("'Equal-weight within sector' feature is in beta. Currently, it calculates cumulative returns with equal-weights given to each ticker. Future interations will add an alternative weighting strategy when unchecked."),
@@ -911,12 +974,12 @@ app_ui = ui.page_fluid(
                     ui.sidebar(
                         ui.input_selectize("etype", "Event type(s)", event_types, multiple=True, selected=event_types[:1] if event_types else []),
                         ui.input_slider("k", "Event window (trading days)", min=1, max=20, value=5),
-                        ui.input_date_range("dater", "Event date range (Data available: 9/30/2024-9/30/2025)", start=dlo, end=dhi),
+                        ui.input_date_range("dater", f"Backtest range ({DATA_AVAIL_TEXT})", start=dlo, end=dhi, min = dlo, max = dhi),
                         ui.input_checkbox_group("sector", "Sectors", sector_choices, inline=False),
                         ui.input_checkbox("no_overlap", "Exclude overlapping days (co-occurring events)", value=False),
                         ui.input_action_button("go", "Run"),
                         ui.hr(),
-                        ui.help_text("Uses average cumulative log returns for each relative day. buy and hold; equal-weight at start if checked and inverse-price static weight if unchecked."),
+                        ui.help_text("Uses log returns. Abnormal return assumes expected return = 0."),
                         ui.hr(),
                         ui.help_text("Educational use only — not financial advice."),       
                     ),
@@ -933,11 +996,17 @@ app_ui = ui.page_fluid(
                     ui.sidebar(
                         ui.input_selectize("ind_etype", "Event type(s)", event_types, multiple=True, selected=event_types[:1] if event_types else []),
                         ui.input_slider("ind_k", "Event window (trading days)", min=1, max=20, value=5),
-                        ui.input_date_range("ind_dater", "Event date range (Data available: 9/30/2024-9/30/2025)", start=dlo, end=dhi),
-                        ui.input_selectize("ind_tickers", "Pick tickers (1–10)", ticker_choices, multiple=True),
+                        ui.input_date_range("ind_dater", f"Backtest range ({DATA_AVAIL_TEXT})", start=dlo, end=dhi, min = dlo, max = dhi),
+                        
+                        ui.input_text("ind_ticker_search", "Search tickers", placeholder="Type e.g. aa, nv, msft"), # replaces ui.input_selectize("ind_tickers", "Pick tickers (1–10)", ticker_choices, multiple=True),
+                        ui.input_selectize("ind_matches", "Matches", choices=[], multiple=False), # replaces # ui.input_selectize("ind_tickers", "Pick tickers (1–10)", ticker_choices, multiple=True),
+                        ui.input_action_button("ind_add", "Add ticker"), # replaces # ui.input_selectize("ind_tickers", "Pick tickers (1–10)", ticker_choices, multiple=True),
+                        ui.input_action_button("ind_clear", "Clear tickers"), # replaces # ui.input_selectize("ind_tickers", "Pick tickers (1–10)", ticker_choices, multiple=True),
+                        ui.output_text("ind_selected"), # replaces # ui.input_selectize("ind_tickers", "Pick tickers (1–10)", ticker_choices, multiple=True),
+
                         ui.input_action_button("ind_go", "Run"),
                         ui.hr(),
-                        ui.help_text("Uses average cumulative log returns for each relative day. buy and hold; equal-weight at start if checked and inverse-price static weight if unchecked."),
+                        ui.help_text("Uses log returns. Abnormal return assumes expected return = 0."),
                         ui.hr(),
                         ui.help_text("Educational use only — not financial advice."),      
                     ),
@@ -960,7 +1029,7 @@ app_ui = ui.page_fluid(
                 ui.div(     
                     ui.markdown(etfs_markdown),
                     # Add some padding for better readability
-                    {"style": "padding: 2rem;"}
+                    style= "padding: 2rem;",
                 ),
             ),            
         ), 
@@ -982,19 +1051,212 @@ app_ui = ui.page_fluid(
 # ║  Server logic                                                            ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 def server(input, output, session):
+    con_holder = {"con": None}
+
+    def get_session_con() -> duckdb.DuckDBPyConnection:
+        if con_holder["con"] is not None:
+            return con_holder["con"]
+
+        con = duckdb.connect(database=":memory:")
+        _configure_duckdb_s3(con)
+
+        def _ddb_quote_string(s: str) -> str:
+            return "'" + s.replace("\\", "\\\\").replace("'", "''") + "'"
+
+        con.execute(
+            f"CREATE OR REPLACE VIEW ae AS "
+            f"SELECT * FROM read_parquet({_ddb_quote_string(S3_URI)});"
+        )
+
+        con.execute("""
+        CREATE OR REPLACE VIEW events AS
+        WITH filing AS (
+          SELECT DISTINCT upper(ticker) AS ticker, date::DATE AS date, filing_form AS event_type, sector
+          FROM ae
+          WHERE filing_form IS NOT NULL
+        ),
+        splits AS (
+          SELECT DISTINCT upper(ticker) AS ticker, date::DATE AS date, 'SPLIT' AS event_type, sector
+          FROM ae
+          WHERE is_split_day = TRUE
+        ),
+        rsplits AS (
+          SELECT DISTINCT upper(ticker) AS ticker, date::DATE AS date, 'REVERSE_SPLIT' AS event_type, sector
+          FROM ae
+          WHERE is_reverse_split_day = TRUE
+        ),
+        all_events AS (
+          SELECT * FROM filing
+          UNION ALL SELECT * FROM splits
+          UNION ALL SELECT * FROM rsplits
+        ),
+        counts AS (
+          SELECT ticker, date, COUNT(*) AS n_events
+          FROM all_events
+          GROUP BY 1,2
+        )
+        SELECT e.*, c.n_events, (c.n_events > 1) AS is_overlap
+        FROM all_events e
+        JOIN counts c USING (ticker, date);
+        """)
+
+        con_holder["con"] = con
+
+        def _cleanup():
+            try:
+                con.close()
+            except Exception:
+                pass
+            con_holder["con"] = None
+
+        session.on_ended(_cleanup)
+        return con
     
     # ─────────────────────────────────────────────────────────────────────────
-    # 2) PORTFOLIO SIMULATOR
+    # 1) PORTFOLIO SIMULATOR (DuckDB-backed)
     # ─────────────────────────────────────────────────────────────────────────
+
+    def _search_tickers(prefix: str, limit: int = 25) -> list[str]:
+        prefix = (prefix or "").strip().upper()
+        # Minimum length helps avoid returning huge match lists and reduces churn
+        if len(prefix) < 2:
+            return []
+
+        # Fast in-memory prefix match
+        out = [t for t in TICKER_UNIVERSE if t.startswith(prefix)]
+        return out[: int(limit)]
+
+    def _p_query_df(tickers: list[str], d0: pd.Timestamp, d1: pd.Timestamp) -> pd.DataFrame:
+        """
+        Pull only the rows needed for the portfolio simulator from DuckDB/S3.
+        Returns columns: date, ticker, logret, close
+        """
+        if not tickers:
+            return pd.DataFrame(columns=["date", "ticker", "logret", "close"])
+
+        # DuckDB parameter binding does not accept a Python list directly as IN (...)
+        # so we build the placeholders safely and pass params.
+        placeholders = ", ".join(["?"] * len(tickers))
+        sql = f"""
+            SELECT
+              date::DATE AS date,
+              upper(ticker) AS ticker,
+              logret,
+              close
+            FROM ae
+            WHERE upper(ticker) IN ({placeholders})
+              AND date::DATE BETWEEN ? AND ?
+            ORDER BY date, ticker;
+        """
+        params = list(tickers) + [str(d0.date()), str(d1.date())]
+
+        con = get_session_con()
+        df = con.execute(sql, params).df()
+        if not df.empty:
+            df["date"] = pd.to_datetime(df["date"]).dt.normalize()
+            df["ticker"] = df["ticker"].astype(str).str.upper()
+            df["logret"] = pd.to_numeric(df["logret"], errors="coerce")
+            df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        return df
+
+
+
+    selected_p = reactive.Value([])
+    selected_ind = reactive.Value([])
+
+    @reactive.calc
+    def ind_match_choices():
+        q = input.ind_ticker_search()
+        if not q or len(q.strip()) < 2:
+            return []
+        rows = _search_tickers(q, limit=30)
+        return rows
+
+    @reactive.effect
+    def _update_ind_matches():
+        choices = ind_match_choices()
+        ui.update_selectize("ind_matches", choices=choices, selected=(choices[0] if choices else None))
+
+    @reactive.effect
+    @reactive.event(input.ind_add)
+    def _ind_add_ticker():
+        t = input.ind_matches()
+        if not t:
+            return
+        cur = selected_ind.get()
+        t = str(t).upper().strip()
+        if t not in cur:
+            selected_ind.set((cur + [t])[:10])
+
+    @reactive.effect
+    @reactive.event(input.ind_clear)
+    def _ind_clear_tickers():
+        selected_ind.set([])
+
+    @output
+    @render.text
+    def ind_selected():
+        cur = selected_ind.get()
+        if not cur:
+            return "Selected: (none)"
+        return "Selected: " + ", ".join(cur)
+
+    @reactive.calc
+    def p_match_choices():
+        q = input.p_ticker_search()
+        if not q or len(q.strip()) < 2:
+            return []
+        rows = _search_tickers(q, limit=30)
+        return rows
+
+    @reactive.effect
+    def _update_p_matches():
+        choices = p_match_choices()
+        ui.update_selectize("p_matches", choices=choices, selected=(choices[0] if choices else None))
+
+
+
+
+
+    @reactive.effect
+    @reactive.event(input.p_add)
+    def _p_add_ticker():
+        t = input.p_matches()
+        if not t:
+            return
+        cur = selected_p.get()
+        t = str(t).upper().strip()
+        if t not in cur:
+            selected_p.set((cur + [t])[:10])   # keep 1–10 like your UI
+
+    @reactive.effect
+    @reactive.event(input.p_clear)
+    def _p_clear_tickers():
+        selected_p.set([])
+
+    @output
+    @render.text
+    def p_selected():
+        cur = selected_p.get()
+        if not cur:
+            return "Selected: (none)"
+        return "Selected: " + ", ".join(cur)
+
+
+
+
+    @reactive.calc
     @reactive.event(input.p_go)
     def _p_params():
-        tickers = (input.p_tickers() or [])[:10]  # light cap
+        tickers = selected_p.get()[:10]
         amt = float(input.p_cash() or 10_000)
         eq = bool(input.p_equal())
         dr = input.p_dater()
         d0 = pd.to_datetime(dr[0]).normalize() if dr else pd.to_datetime(dlo)
         d1 = pd.to_datetime(dr[1]).normalize() if dr else pd.to_datetime(dhi)
         return tickers, amt, eq, d0, d1
+
+
 
     @reactive.calc
     @reactive.event(input.p_go)
@@ -1003,124 +1265,103 @@ def server(input, output, session):
         if not tickers:
             return pd.DataFrame()
 
-        # Slice AE to chosen tickers + dates
-        df = AE.loc[
-            (AE["ticker"].isin(tickers)) &
-            (AE["date"].between(d0, d1)),
-            ["date", "ticker", "logret", "close"]
-        ].copy()
+        # Pull from DuckDB (instead of slicing pandas AE)
+        df = _p_query_df(tickers, d0, d1)
         if df.empty:
             return pd.DataFrame()
 
-        # Pivot to wide: simple returns per ticker per day
+        # daily simple returns
         df["r"] = _simple_returns(df["logret"])
+
+        # Pivot to wide: one column per ticker
         r_wide = (
             df.pivot_table(index="date", columns="ticker", values="r", aggfunc="mean")
-            .sort_index()
-            .fillna(0.0)
+              .sort_index()
+              .fillna(0.0)
         )
-
-        # If no usable return data, bail out
         if r_wide.shape[1] == 0:
             return pd.DataFrame()
 
-        # Per-ticker cumulative index (start at 1)
+        # Per-ticker cumulative index (rebased to start at 1)
         cum = (1.0 + r_wide).cumprod()
         cum = cum.div(cum.iloc[0].replace(0, np.nan), axis=1).fillna(1.0)
 
         if eq:
-            # --- BUY-AND-HOLD (equal dollars at start, no rebalancing) ---
+            # Equal-weight buy-and-hold
             n = r_wide.shape[1]
-            w0 = pd.Series(1.0 / max(1, n), index=r_wide.columns)  # sum = 1
-
-            # Portfolio wealth path: initial weights applied once to cumulative paths
-            wealth_index = (cum.mul(w0, axis=1)).sum(axis=1)  # starts at 1
+            w0 = pd.Series(1.0 / max(1, n), index=r_wide.columns)
+            wealth_index = (cum.mul(w0, axis=1)).sum(axis=1)
         else:
-            # --- INVERSE-PRICE STATIC WEIGHTS (buy once, fixed by 1/price₀) ---
+            # Inverse-price static weights
             first_prices = (
                 df.sort_values("date")
-                .dropna(subset=["close"])
-                .groupby("ticker")["close"].first()
-                .reindex(r_wide.columns)
+                  .dropna(subset=["close"])
+                  .groupby("ticker")["close"].first()
+                  .reindex(r_wide.columns)
             )
 
             invp = 1.0 / first_prices.replace(0, np.nan)
             invp = invp / invp.sum()
 
-            # Fallback if all weights are NaN (e.g., missing first prices)
             if not np.isfinite(invp).any():
                 invp = pd.Series(1.0 / r_wide.shape[1], index=r_wide.columns)
 
             invp = invp.fillna(0.0)
             wealth_index = (cum.mul(invp, axis=1)).sum(axis=1)
 
-        # Scale index to dollars and compute daily portfolio return
         wealth = wealth_index * amt
         r_daily = wealth.pct_change().fillna(0.0)
         r_total = wealth / wealth.iloc[0] - 1
 
-        # Also expose per-ticker cumulative indices (start at 1)
-        tickers_cum = cum.copy()
-
         out = (
             pd.concat(
-                [wealth.rename("portfolio_$"), 
-                 r_daily.rename("portfolio_r_daily"),
-                 r_total.rename("portfolio_r_total")],
-                axis=1
+                [
+                    wealth.rename("portfolio_$"),
+                    r_daily.rename("portfolio_r_daily"),
+                    r_total.rename("portfolio_r_total"),
+                ],
+                axis=1,
             )
-            .join(tickers_cum.add_prefix("Cumulative return: "), how="left")
+            .join(cum.add_prefix("Cumulative return: "), how="left")
         )
         out.index = pd.to_datetime(out.index)
         return out
-    
-    # ---- Portfolio meta (weights, $spent, shares, final values) -----------------
+
+
     @reactive.calc
     @reactive.event(input.p_go)
     def _p_meta():
         """
         Returns dict of Series (index = ticker):
-        w0           : initial weights (sum≈1 across usable tickers)
-        p0           : first close in window
-        spent        : initial dollars allocated = amt * w0
-        shares0      : fractional shares = spent / p0
-        final_values : end-of-period dollars per ticker = spent * cum_last
+          w0, p0, spent, shares0, final_values
         """
         tickers, amt, eq, d0, d1 = _p_params()
         if not tickers:
             return None
 
-        df = AE.loc[
-            (AE["ticker"].isin(tickers)) & (AE["date"].between(d0, d1)),
-            ["date", "ticker", "logret", "close"],
-        ].copy()
+        df = _p_query_df(tickers, d0, d1)
         if df.empty:
             return None
 
-        # daily simple returns → wide
         df["r"] = _simple_returns(df["logret"])
         r_wide = (
             df.pivot_table(index="date", columns="ticker", values="r", aggfunc="mean")
-            .sort_index()
-            .fillna(0.0)
+              .sort_index()
+              .fillna(0.0)
         )
         if r_wide.shape[1] == 0:
             return None
 
-        # cumulative index rebased to 1
         cum = (1.0 + r_wide).cumprod()
         cum = cum.div(cum.iloc[0].replace(0, np.nan), axis=1).fillna(1.0)
 
-        # first close per ticker (for shares & inverse-price)
         p0 = (
             df.sort_values("date")
-            .dropna(subset=["close"])
-            .groupby("ticker")["close"]
-            .first()
-            .reindex(r_wide.columns)
+              .dropna(subset=["close"])
+              .groupby("ticker")["close"].first()
+              .reindex(r_wide.columns)
         )
 
-        # weights
         if eq:
             n = r_wide.shape[1]
             w0 = pd.Series(1.0 / max(1, n), index=r_wide.columns)
@@ -1131,12 +1372,12 @@ def server(input, output, session):
             else:
                 w0 = (invp / invp.sum()).fillna(0.0)
 
-        spent        = (amt * w0).fillna(0.0)
-        shares0      = (spent / p0.replace(0, np.nan)).fillna(0.0)
-        cum_last     = cum.iloc[-1]
+        spent = (amt * w0).fillna(0.0)
+        shares0 = (spent / p0.replace(0, np.nan)).fillna(0.0)
+
+        cum_last = cum.iloc[-1]
         final_values = (spent * cum_last).fillna(0.0)
 
-        # keep original column order for stable labeling
         idx = r_wide.columns
         return {
             "w0": w0.loc[idx],
@@ -1146,17 +1387,17 @@ def server(input, output, session):
             "final_values": final_values.loc[idx],
         }
 
-    # Reactive color map for the current portfolio selection
+
     @reactive.calc
     def _p_color_map():
-        """Compute a stable ticker→color mapping for the current selection."""
         m = _p_meta()
         if not m:
             return {}
-        # ⚠️ If your _p_meta uses 'shares0'/'final_values', mirror those names here:
-        labels = (pd.Index(m["spent"].index)
-                .union(m["shares0"].index)
-                .union(m["final_values"].index))
+        labels = (
+            pd.Index(m["spent"].index)
+              .union(m["shares0"].index)
+              .union(m["final_values"].index)
+        )
         return _build_color_map(labels)
 
 
@@ -1172,9 +1413,10 @@ def server(input, output, session):
         return _pie_fig(
             names=s.index, values=s.values,
             title="Initial $ allocation (weights)",
-            unit="currency", percent=True,
+            unit="currency", percent=False,
             color_map=cmap,
         )
+
 
     @output
     @render_widget
@@ -1184,11 +1426,11 @@ def server(input, output, session):
         if not m:
             return None
         cmap = _p_color_map()
-        s = m["shares0"] # shares bought at start
+        s = m["shares0"]
         return _pie_fig(
             names=s.index, values=s.values,
             title="Initial shares",
-            unit="shares", percent=True, # percent of shares isn’t very meaningful
+            unit="shares", percent=True,
             color_map=cmap,
         )
 
@@ -1201,14 +1443,14 @@ def server(input, output, session):
         if not m:
             return None
         cmap = _p_color_map()
-        s = m["final_values"] # end-of-period $ per ticker
+        s = m["final_values"]
         return _pie_fig(
             names=s.index, values=s.values,
             title="Final value by ticker",
             unit="currency", percent=True,
             color_map=cmap,
         )
-    
+
 
     @output
     @render.text
@@ -1218,12 +1460,13 @@ def server(input, output, session):
         if df.empty:
             return "No data for the selected tickers / date range."
         start_val = float(df["portfolio_$"].iloc[0])
-        end_val   = float(df["portfolio_$"].iloc[-1])
+        end_val = float(df["portfolio_$"].iloc[-1])
         total_ret = (end_val / start_val - 1.0) if start_val else 0.0
         return (
             f"Portfolio start → end: ${start_val:,.0f} → ${end_val:,.0f}  |  "
             f"Total return: {total_ret*100:,.1f}%  |  Days: {len(df)}"
         )
+
 
     @output
     @render_widget
@@ -1236,7 +1479,7 @@ def server(input, output, session):
             fig.add_annotation(
                 text="No data",
                 x=0.5, y=0.5, xref="paper", yref="paper",
-                showarrow=False, font=dict(size=14)
+                showarrow=False, font=dict(size=14),
             )
             fig.update_layout(template="plotly_white")
             return fig
@@ -1249,18 +1492,18 @@ def server(input, output, session):
                 hovertemplate="%{x|%Y-%m-%d}<br>$%{y:,.0f}<extra></extra>",
             )
         )
-
         fig.update_layout(
             title="Assets Under Management ($)",
             xaxis_title="Date",
             yaxis_title="Value ($)",
-            title_x = 0.5,
+            title_x=0.5,
             template="plotly_white",
             hovermode="x unified",
             margin=dict(t=60, r=20, b=40, l=60),
         )
         fig.update_yaxes(tickprefix="$", separatethousands=True)
         return fig
+
 
     @output
     @render.table
@@ -1269,29 +1512,82 @@ def server(input, output, session):
         df = p_panel()
         if df.empty:
             return pd.DataFrame()
-        # Show last values for the portfolio + per-ticker cumulative indices
-        last = df.tail(1).drop(columns=["portfolio_r_daily", "portfolio_r_total", "portfolio_$"]).T.reset_index()
+        last = (
+            df.tail(1)
+              .drop(columns=["portfolio_r_daily", "portfolio_r_total", "portfolio_$"])
+              .T.reset_index()
+        )
         last.columns = ["Individual stock contributions", "Cumulative return index (start = 1)"]
         return last
+
 
     @output
     @render.download(filename=lambda: "portfolio_series.csv")
     @reactive.event(input.p_go)
     def p_dl():
         df = p_panel()
-        yield (df.reset_index().rename(columns={"index": "date"}).to_csv(index=False).encode())
+        yield df.reset_index().rename(columns={"index": "date"}).to_csv(index=False).encode()
+
+
+
 
     # ─────────────────────────────────────────────────────────────────────────
-    # 3) SECTOR EXPLORER
+    # 2) SECTOR EXPLORER (DuckDB-backed)
     # ─────────────────────────────────────────────────────────────────────────
+
+    def _s_query_df(secs: list[str], d0: pd.Timestamp, d1: pd.Timestamp) -> pd.DataFrame:
+        """
+        Pull only the rows needed for the sector explorer from DuckDB/S3.
+        Returns: date, ticker, sector, logret, is_split_day, is_reverse_split_day
+        """
+        if not secs:
+            return pd.DataFrame(columns=["date", "ticker", "sector", "logret", "is_split_day", "is_reverse_split_day"])
+
+        # Normalize sectors to strings (DuckDB filter will match exact values)
+        secs = [str(s).strip() for s in secs if str(s).strip()]
+        if not secs:
+            return pd.DataFrame(columns=["date", "ticker", "sector", "logret", "is_split_day", "is_reverse_split_day"])
+
+        placeholders = ", ".join(["?"] * len(secs))
+        sql = f"""
+            SELECT
+              date::DATE AS date,
+              UPPER(ticker) AS ticker,
+              TRIM(sector) AS sector,
+              logret,
+              COALESCE(is_split_day, false) AS is_split_day,
+              COALESCE(is_reverse_split_day, false) AS is_reverse_split_day
+            FROM ae
+            WHERE TRIM(sector) IN ({placeholders})
+              AND date::DATE BETWEEN ? AND ?
+            ORDER BY date, ticker;
+        """
+        params = list(secs) + [str(d0.date()), str(d1.date())]
+
+        con = get_session_con()
+        df = con.execute(sql, params).df()
+        if not df.empty:
+            df["date"] = pd.to_datetime(df["date"]).dt.normalize()
+            df["ticker"] = df["ticker"].astype(str).str.upper()
+            df["sector"] = df["sector"].astype("object")
+            df["logret"] = pd.to_numeric(df["logret"], errors="coerce")
+            # keep flags as bool
+            df["is_split_day"] = df["is_split_day"].astype(bool)
+            df["is_reverse_split_day"] = df["is_reverse_split_day"].astype(bool)
+        return df
+
+
+    @reactive.calc
     @reactive.event(input.s_go)
     def _s_params():
         secs = input.s_sectors() or []
+        secs = [str(s).strip() for s in secs if str(s).strip()]
         eq = bool(input.s_equal())
         dr = input.s_dater()
         d0 = pd.to_datetime(dr[0]).normalize() if dr else pd.to_datetime(dlo)
         d1 = pd.to_datetime(dr[1]).normalize() if dr else pd.to_datetime(dhi)
         return secs, eq, d0, d1
+
 
     @reactive.calc
     @reactive.event(input.s_go)
@@ -1300,99 +1596,43 @@ def server(input, output, session):
         if not secs:
             return pd.DataFrame()
 
-        # Slice to selected sectors + dates
-        need_cols = ["date", "ticker", "sector", "logret"]
-        if not set(need_cols).issubset(AE.columns):
-            return pd.DataFrame()
-        df = AE.loc[
-            (AE["sector"].isin(secs)) &
-            (AE["date"].between(d0, d1)),
-            need_cols
-        ].copy()
+        # Pull from DuckDB (instead of slicing pandas AE)
+        df = _s_query_df(secs, d0, d1)
         if df.empty:
             return pd.DataFrame()
 
-        # df["r"] = _simple_returns(df["logret"]) (DEPRICATED DUE TO ISSUES WITH HEALTHCARE SECTOR SPLIT-RELATED INDEX EXPLOSION)
+        # Compute simple returns safely
         df["r"] = _simple_returns(df["logret"]).astype("float64")
         df["r"].replace([np.inf, -np.inf], np.nan, inplace=True)
 
-        # 1) Neutralize split days if you have flags
-        if {"is_split_day", "is_reverse_split_day"}.issubset(AE.columns):
-            # Map (date,ticker) → split flags, align, and null those returns
-            flags = (
-                AE.loc[:, ["date", "ticker", "is_split_day", "is_reverse_split_day"]]
-                .set_index(["date", "ticker"])
-            )
-            m = df.set_index(["date", "ticker"]).index
-            split_hits = flags.reindex(m).fillna(False).any(axis=1).to_numpy()
-            df.loc[split_hits, "r"] = np.nan
+        # Neutralize split days using flags from the same query (no join needed)
+        split_hits = (df["is_split_day"] | df["is_reverse_split_day"]).to_numpy()
+        df.loc[split_hits, "r"] = np.nan
 
-        # 2) De-dup (date,ticker) before sector averaging
+        # De-dup (date,ticker) before sector averaging
         df = (
             df.groupby(["date", "ticker", "sector"], as_index=False, observed=True)["r"]
-            .mean()
+              .mean()
         )
 
-        # 3) (Optional but practical) Winsorize extremes that slip through
+        # Winsorize extremes
         df["r"] = df["r"].clip(lower=-0.95, upper=0.95)
 
+        # Equal-weight within sector (your existing behavior)
+        sec_daily = (
+            df.groupby(["date", "sector"], observed=True)["r"]
+              .mean()
+              .unstack("sector")
+              .sort_index()
+              .fillna(0.0)
+        )
 
-        # # ---- DIAGNOSTICS (after r computed) ----
-        # if "Healthcare" in df["sector"].dropna().unique():
-        #     dfh = df.loc[df["sector"] == "Healthcare", ["date","ticker","r"]].copy()
-        #     bad_nonfinite = dfh.loc[~np.isfinite(dfh["r"])]
-        #     bad_big_pos  = dfh.loc[dfh["r"] > 1]
-        #     bad_big_neg  = dfh.loc[dfh["r"] < -0.95]
-
-        #     print("\n[DBG] Healthcare r describe:\n", dfh["r"].describe(), flush=True)
-        #     print("[DBG] Non-finite r rows:", len(bad_nonfinite), flush=True)
-        #     print("[DBG] r > 1 (top 10):\n", bad_big_pos.sort_values("r", ascending=False).head(10), flush=True)
-        #     print("[DBG] r < -0.95 (bottom 10):\n", bad_big_neg.sort_values("r", ascending=True).head(10), flush=True)
-
-
-        # Option A: equal-weight within sector (average across tickers each day)
-        if eq:
-            sec_daily = (
-                df.groupby(["date", "sector"], observed=True)["r"]
-                  .mean()
-                  .unstack("sector")
-                  .sort_index()
-                  .fillna(0.0)
-            )
-        else:
-            # Price or cap weights aren’t guaranteed here; fallback to equal-weight
-            sec_daily = (
-                df.groupby(["date", "sector"], observed=True)["r"]
-                  .mean()
-                  .unstack("sector")
-                  .sort_index()
-                  .fillna(0.0)
-            )
-
-        # # The “sec_daily Healthcare top/bottom” block
-        # if "Healthcare" in sec_daily.columns:
-        #     hc = sec_daily["Healthcare"]
-        #     print("[DBG] sec_daily Healthcare top 10 days:\n",
-        #         hc.sort_values(ascending=False).head(10), flush=True)
-        #     print("[DBG] sec_daily Healthcare bottom 10 days:\n",
-        #         hc.sort_values(ascending=True).head(10), flush=True)
-
-        # Build cumulative index for each sector (start at 1)
+        # Cumulative index per sector (start at 1)
         sec_cum = (1.0 + sec_daily.fillna(0.0)).cumprod()
-
-        # …and REBASE so the first row is exactly 1.0 for every sector.
         sec_cum = sec_cum.div(sec_cum.iloc[0].replace(0, np.nan), axis=1).fillna(1.0)
 
-        # # ---- TEMP DEBUG (force-flush so you can see it) ----
-        # if not sec_cum.empty:
-        #     print("\n[s_panel] sec_daily head:\n", sec_daily.head(3), flush=True)
-        #     print("[s_panel] sec_cum head:\n", sec_cum.head(3), flush=True)
-        #     print("[s_panel] first row of sec_cum:\n", sec_cum.iloc[0], flush=True)
-        # # ---- END DEBUG ----
-        # print(f"[s_panel] secs={secs}, eq={eq}, d0={d0.date()} d1={d1.date()}", flush=True)
-
         return sec_cum
-    
+
 
     @output
     @render.text
@@ -1403,6 +1643,7 @@ def server(input, output, session):
             return "No data for the selected sectors / date range."
         cols = list(df.columns)
         return f"Sectors: {', '.join(cols)}  |  Days: {len(df)}"
+
 
     @output
     @render_widget
@@ -1415,12 +1656,11 @@ def server(input, output, session):
             fig.add_annotation(
                 text="No data",
                 x=0.5, y=0.5, xref="paper", yref="paper",
-                showarrow=False, font=dict(size=14)
+                showarrow=False, font=dict(size=14),
             )
             fig.update_layout(template="plotly_white", title_x=0.5)
             return fig
-        
-        # One line per sector
+
         for c in df.columns:
             fig.add_trace(
                 go.Scatter(
@@ -1442,6 +1682,7 @@ def server(input, output, session):
         )
         return fig
 
+
     @output
     @render.table
     @reactive.event(input.s_go)
@@ -1449,41 +1690,145 @@ def server(input, output, session):
         df = s_panel()
         if df.empty:
             return pd.DataFrame()
+
         last = df.tail(1).T.reset_index()
         last.columns = ["Sector", "Cumulative return index (start = 1)"]
         last["Total return"] = last["Cumulative return index (start = 1)"] - 1.0
-        # nice rounding for display
         last["Cumulative return index (start = 1)"] = last["Cumulative return index (start = 1)"].round(3)
         last["Total return"] = (last["Total return"] * 100).round(2).astype(str) + "%"
         return last
+
 
     @output
     @render.download(filename=lambda: "sector_indices.csv")
     @reactive.event(input.s_go)
     def s_dl():
         df = s_panel()
-        yield (df.reset_index().rename(columns={"index": "date"}).to_csv(index=False).encode())
+        yield df.reset_index().rename(columns={"index": "date"}).to_csv(index=False).encode()
+
+
+
 
 
     # ─────────────────────────────────────────────────────────────────────────
-    # 1) EVENT STUDY
+    # 3A) EVENT STUDY (DuckDB-backed)
     # ─────────────────────────────────────────────────────────────────────────
 
+    def _es_query_panel(
+        sel_types: list[str],
+        k: int,
+        date_lo: pd.Timestamp,
+        date_hi: pd.Timestamp,
+        sectors: list[str],
+        no_overlap: bool,
+    ) -> pd.DataFrame:
+        sel_types = [str(x).strip() for x in (sel_types or []) if str(x).strip()]
+        sectors   = [str(x).strip() for x in (sectors or []) if str(x).strip()]
+        k = int(k)
+
+        where_clauses = ["e.date BETWEEN ?::DATE AND ?::DATE"]
+        params: list = [str(date_lo.date()), str(date_hi.date())]
+
+        if sel_types:
+            ph = ", ".join(["?"] * len(sel_types))
+            where_clauses.append(f"e.event_type IN ({ph})")
+            params.extend(sel_types)
+
+        if sectors:
+            ph = ", ".join(["?"] * len(sectors))
+            where_clauses.append(f"e.sector IN ({ph})")
+            params.extend(sectors)
+
+        if no_overlap:
+            where_clauses.append("e.is_overlap = FALSE")
+
+        where_sql = " AND ".join(where_clauses)
+
+        k = int(k)
+
+        sql = f"""
+        WITH ae_base AS (
+          SELECT
+            upper(ticker) AS ticker,
+            date::DATE    AS date,
+            logret,
+            sector,
+            tidx::INTEGER AS tidx
+          FROM ae
+          WHERE tidx IS NOT NULL
+        ),
+        events_scoped AS (
+          SELECT
+            upper(ticker) AS ticker,
+            date::DATE    AS event_date,
+            event_type,
+            sector,
+            n_events,
+            is_overlap
+          FROM events e
+          WHERE {where_sql}
+        ),
+        events_with_tidx AS (
+          SELECT es.*, a.tidx AS event_tidx
+          FROM events_scoped es
+          JOIN ae_base a
+            ON a.ticker = es.ticker AND a.date = es.event_date
+        ),
+        offsets AS (
+          SELECT * EXCLUDE(range), range AS rel_day
+          FROM range(-{k}, {k} + 1)
+        ),
+        windows AS (
+          SELECT
+            e.ticker,
+            e.event_type,
+            e.sector,
+            e.event_date,
+            e.n_events,
+            e.is_overlap,
+            o.rel_day,
+            (e.event_tidx + o.rel_day) AS tidx
+          FROM events_with_tidx e
+          CROSS JOIN offsets o
+        )
+        SELECT
+          w.ticker,
+          w.event_type,
+          w.sector,
+          w.event_date,
+          a.date,
+          w.rel_day,
+          a.logret,
+          w.n_events,
+          w.is_overlap
+        FROM windows w
+        JOIN ae_base a
+          ON a.ticker = w.ticker AND a.tidx = w.tidx
+        ORDER BY w.event_date, w.ticker, a.date;
+        """
+
+        con = get_session_con()
+        df = con.execute(sql, params).df()
+        if df.empty:
+            return pd.DataFrame()
+
+        df["event_date"] = pd.to_datetime(df["event_date"]).dt.normalize()
+        df["date"]       = pd.to_datetime(df["date"]).dt.normalize()
+        df["rel_day"]    = pd.to_numeric(df["rel_day"], errors="coerce").astype("int16")
+        df["ticker"]     = df["ticker"].astype(str).str.upper()
+        df["event_type"] = df["event_type"].astype("object")
+        df["logret"]     = pd.to_numeric(df["logret"], errors="coerce").astype("float64")
+        df["sector"]     = df["sector"].astype("object")
+        return df
+
+    @reactive.calc
     @reactive.event(input.go)
     def _params():
-        """
-        Returns:
-            sel_types (list[str])  : event types selected by user
-            k        (int)         : window size
-            date_lo/hi (Timestamp) : event date range
-            sectors  (list[str])   : sector filters (may be empty)
-            no_overlap (bool)      : drop days with multiple event types per ticker
-        """
         sel_types = input.etype() or []
         k = int(input.k())
         dr = input.dater()
-        date_lo = pd.to_datetime(dr[0]).normalize() if dr else pd.Timestamp("2022-01-01")
-        date_hi = pd.to_datetime(dr[1]).normalize() if dr else pd.Timestamp(date.today())
+        date_lo = pd.to_datetime(dr[0]).normalize() if dr else pd.Timestamp(dlo)
+        date_hi = pd.to_datetime(dr[1]).normalize() if dr else pd.Timestamp(dhi)
         sectors = input.sector() or []
         no_overlap = bool(input.no_overlap())
         return sel_types, k, date_lo, date_hi, sectors, no_overlap
@@ -1491,73 +1836,30 @@ def server(input, output, session):
     @reactive.calc
     @reactive.event(input.go)
     def panel() -> pd.DataFrame:
-        """
-        Build ±k trading-day windows around each selected event *type*.
-        Returns tidy columns:
-            ['ticker','event_type','event_date','date','rel_day','logret']
-        """
         sel_types, k, date_lo, date_hi, sectors, no_overlap = _params()
+        return _es_query_panel(sel_types, k, date_lo, date_hi, sectors, no_overlap)
 
-        # 1) Filter EVENTS by user selections
-        ev = EVENTS.copy()
-        mask = ev["date"].between(date_lo, date_hi)
-        if sel_types:
-            mask &= ev["event_type"].isin(sel_types)
-        if sectors and "sector" in ev.columns:
-            mask &= ev["sector"].isin(sectors)
-        if no_overlap:
-            mask &= ~ev["is_overlap"]
-
-        ev = ev.loc[mask, ["ticker", "date", "event_type"]].rename(columns={"date": "event_date"})
-        if ev.empty:
-            return pd.DataFrame()
-        print(f"ev_masked: {ev}")
-
-        # 2) Map each (ticker, event_date) to its trading-day index (event_tidx)
-        idx_map = AE.loc[:, ["ticker", "date", "tidx"]].rename(columns={"date": "event_date", "tidx": "event_tidx"})
-        ev = ev.merge(idx_map, on=["ticker", "event_date"], how="left").dropna(subset=["event_tidx"])
-        if ev.empty:
-            return pd.DataFrame()
-        print(f"ev_idx_mapped: {ev}")
-
-        # 3) Cross-join with offsets −k..+k
-        offsets = pd.DataFrame({"rel_day": np.arange(-k, k + 1, dtype=np.int16)})
-        evx = ev.merge(offsets, how="cross")
-        evx["tidx"] = evx["event_tidx"] + evx["rel_day"]
-        print(f"evx: {evx}")
-
-        # 4) Join back to AE to fetch actual date & log returns
-        base = AE.loc[:, ["ticker", "tidx", "date", "logret"]]
-        out = (
-            evx.merge(base, on=["ticker", "tidx"], how="left")
-                .dropna(subset=["date"])
-                .sort_values(["ticker", "event_date", "date"])
-                .loc[:, ["ticker", "event_type", "event_date", "date", "rel_day", "logret"]]
-        )
-        print(f"out: {out}")
-        return out
 
     @output
     @render.text
     @reactive.event(input.go)
     def summary():
-        """Human-friendly summary of the current run"""
         df = panel()
         if df.empty:
-            return f"No events found. • Source: {DATA_PQ.name}"
+            return "No events found. • Source: S3 (DuckDB)"
         n_ev = df[["ticker", "event_date", "event_type"]].drop_duplicates().shape[0]
         by_rel = df["rel_day"].value_counts().sort_index()
         return (
             f"Events matched: {n_ev} | Rows in ±k: {len(df):,} • "
             f"Min/Max rows per rel_day: {int(by_rel.min())}/{int(by_rel.max())} • "
-            f"Source: {DATA_PQ.name}"
+            f"Source: S3 (DuckDB)"
         )
+
 
     @output
     @render.table
     @reactive.event(input.go)
     def tbl():
-        """Aggregate stats by relative day: mean/median/count of log returns"""
         df = panel()
         if df.empty:
             return pd.DataFrame()
@@ -1567,14 +1869,11 @@ def server(input, output, session):
               .reset_index()
         )
 
+
     @output
     @render_widget
     @reactive.event(input.go)
     def car_plot():
-        """
-        Plot Average CAR with a ±95% CI ribbon using Plotly.
-        CAR = cumulative sum of mean log returns across rel_day.
-        """
         df = panel()
         fig = go.Figure()
 
@@ -1588,47 +1887,43 @@ def server(input, output, session):
             return fig
 
         g = df.groupby("rel_day")["logret"]
-        mu = g.mean().sort_index()                                # mean return per rel_day
-        n  = g.count().sort_index()                               # sample size per rel_day
-        se = g.std(ddof=1).sort_index() / np.sqrt(n.clip(lower=1))  # standard error
+        mu = g.mean().sort_index()
+        n  = g.count().sort_index()
+        sd = g.std(ddof=1).sort_index()
 
-        car    = mu.cumsum()
-        car_lo = (mu - 1.96 * se).cumsum()
-        car_hi = (mu + 1.96 * se).cumsum()
+        # standard error of mean per rel_day
+        se = (sd / np.sqrt(n.clip(lower=1))).fillna(0.0)
 
-        xvals = car.index.values
+        # CAR is cumulative sum of mean abnormal log returns
+        car = mu.cumsum()
 
-        # after you compute mu, n, se, car, car_lo, car_hi
+        # Propagate uncertainty across days (simple independence assumption)
+        car_se = np.sqrt((se ** 2).cumsum())
+        car_lo = car - 1.96 * car_se
+        car_hi = car + 1.96 * car_se
+
         xvals = car.index.astype(int)
 
-        fig = go.Figure()
-
-
-        # CI ribbon: add upper, then lower with fill='tonexty'
         # CI ribbon
-        ci_rgba = "rgba(31, 119, 180, 0.20)"   # 20% opacity; tweak last number (0–1)
+        ci_rgba = "rgba(31, 119, 180, 0.20)"
 
-        # upper bound (no visible line)
         fig.add_trace(go.Scatter(
             x=xvals, y=car_hi.values,
             line=dict(width=0, color="rgba(0,0,0,0)"),
             hoverinfo="skip", showlegend=False, name="CI hi"
         ))
-
-        # lower bound + fill to previous
         fig.add_trace(go.Scatter(
             x=xvals, y=car_lo.values,
             fill="tonexty",
-            fillcolor=ci_rgba,                  # <<< controls ribbon opacity
+            fillcolor=ci_rgba,
             line=dict(width=0, color="rgba(0,0,0,0)"),
             name="95% CI", showlegend=True, hoverinfo="skip"
         ))
 
-        # main CAR line (with % shown in hover via customdata)
         fig.add_trace(go.Scatter(
             x=xvals, y=car.values, mode="lines", name="Avg CAR",
-            customdata=np.expm1(car.values),  # ≈ percent return
-            meta=n.values,                    # sample size at each rel_day
+            customdata=np.expm1(car.values),
+            meta=n.values,
             hovertemplate=(
                 "Day %{x}<br>"
                 "CAR (log): %{y:.4f}<br>"
@@ -1637,118 +1932,165 @@ def server(input, output, session):
             )
         ))
 
-
-        # Event-day vertical line at 0
         fig.add_vline(x=0, line_dash="dash", line_color="black", opacity=0.6)
 
         fig.update_layout(
             title="Average Cumulative Abnormal Log Return (±95% CI)",
             xaxis_title="Relative day",
             yaxis_title="Avg CAR (log units)",
-            title_x = 0.5,
+            title_x=0.5,
             template="plotly_white",
-            hovermode="x unified",  # track single x position
+            hovermode="x unified",
             margin=dict(t=60, r=20, b=40, l=60),
             legend=dict(itemsizing="constant"),
         )
-
         return fig
+
 
     @output
     @render.download(filename=lambda: "event_windows.csv")
     @reactive.event(input.go)
     def dl():
-        """Download the raw (ticker, event_date, date, rel_day, logret) panel as CSV."""
         df = panel()
         if df.empty:
-            # Returning an empty payload avoids a broken download
             yield b""
             return
         yield df.to_csv(index=False).encode()
 
 
     # ─────────────────────────────────────────────────────────────────────────
-    # 1B) EVENT STUDY — INDIVIDUAL STOCKS
+    # 3B) EVENT STUDY — INDIVIDUAL STOCKS (DuckDB-backed)
     # ─────────────────────────────────────────────────────────────────────────
 
+    def _ind_es_query_panel(
+        sel_types: list[str],
+        k: int,
+        date_lo: pd.Timestamp,
+        date_hi: pd.Timestamp,
+        tickers: list[str],
+    ) -> pd.DataFrame:
+        sel_types = [str(x).strip() for x in (sel_types or []) if str(x).strip()]
+        tickers   = [str(x).strip().upper() for x in (tickers or []) if str(x).strip()]
+        k = int(k)
+
+        where_clauses = ["event_date BETWEEN ?::DATE AND ?::DATE"]
+        params: list = [str(date_lo.date()), str(date_hi.date())]
+
+        if sel_types:
+            placeholders = ", ".join(["?"] * len(sel_types))
+            where_clauses.append(f"event_type IN ({placeholders})")
+            params.extend(sel_types)
+
+        if tickers:
+            placeholders = ", ".join(["?"] * len(tickers))
+            where_clauses.append(f"ticker IN ({placeholders})")
+            params.extend(tickers)
+
+        where_sql = " AND ".join(where_clauses)
+
+        k = int(k)
+
+        sql = f"""
+        WITH ae_base AS (
+          SELECT
+            upper(ticker) AS ticker,
+            date::DATE    AS date,
+            logret,
+            filing_form,
+            COALESCE(is_split_day, false)         AS is_split_day,
+            COALESCE(is_reverse_split_day, false) AS is_reverse_split_day,
+            tidx::INTEGER AS tidx
+          FROM ae
+          WHERE tidx IS NOT NULL
+        ),
+        events_all AS (
+          SELECT DISTINCT UPPER(ticker) AS ticker, date::DATE AS event_date, filing_form AS event_type
+          FROM ae_base
+          WHERE filing_form IS NOT NULL
+          UNION ALL
+          SELECT DISTINCT UPPER(ticker) AS ticker, date AS event_date, 'SPLIT' AS event_type
+          FROM ae_base
+          WHERE is_split_day = TRUE
+          UNION ALL
+          SELECT DISTINCT UPPER(ticker) AS ticker, date AS event_date, 'REVERSE_SPLIT' AS event_type
+          FROM ae_base
+          WHERE is_reverse_split_day = TRUE
+        ),
+        events_scoped AS (
+          SELECT DISTINCT ticker, event_date, event_type
+          FROM events_all
+          WHERE {where_sql}
+        ),
+        events_with_tidx AS (
+          SELECT es.*, a.tidx AS event_tidx
+          FROM events_scoped es
+          JOIN ae_base a
+            ON a.ticker = es.ticker AND a.date = es.event_date
+        ),
+        offsets AS (
+          SELECT * EXCLUDE(range), range AS rel_day
+          FROM range(-{k}, {k} + 1)
+        ),
+        windows AS (
+          SELECT
+            e.ticker,
+            e.event_type,
+            e.event_date,
+            o.rel_day,
+            (e.event_tidx + o.rel_day) AS tidx
+          FROM events_with_tidx e
+          CROSS JOIN offsets o
+        )
+        SELECT
+          w.ticker,
+          w.event_type,
+          w.event_date,
+          a.date,
+          w.rel_day,
+          a.logret
+        FROM windows w
+        JOIN ae_base a
+          ON a.ticker = w.ticker AND a.tidx = w.tidx
+        ORDER BY w.ticker, w.event_date, a.date;
+        """
+        
+        con = get_session_con()
+        df = con.execute(sql, params).df()
+        if df.empty:
+            return pd.DataFrame()
+
+        df["event_date"] = pd.to_datetime(df["event_date"]).dt.normalize()
+        df["date"]       = pd.to_datetime(df["date"]).dt.normalize()
+        df["rel_day"]    = pd.to_numeric(df["rel_day"], errors="coerce").astype("int16")
+        df["ticker"]     = df["ticker"].astype(str).str.upper()
+        df["event_type"] = df["event_type"].astype("object")
+        df["logret"]     = pd.to_numeric(df["logret"], errors="coerce").astype("float64")
+        return df
+
+
+    @reactive.calc
     @reactive.event(input.ind_go)
     def _ind_params():
-        """
-        Returns:
-            sel_types (list[str])  : event types (forms) selected by user
-            k        (int)         : window size for ±k trading days
-            date_lo/hi (Timestamp) : event date filter
-            tickers  (list[str])   : which tickers to include
-        """
         sel_types = input.ind_etype() or []
         k = int(input.ind_k())
         dr = input.ind_dater()
-        date_lo = pd.to_datetime(dr[0]).normalize() if dr else pd.Timestamp("2022-01-01")
-        date_hi = pd.to_datetime(dr[1]).normalize() if dr else pd.Timestamp(date.today())
-        tickers = input.ind_tickers() or []
+        date_lo = pd.to_datetime(dr[0]).normalize() if dr else pd.Timestamp(dlo)
+        date_hi = pd.to_datetime(dr[1]).normalize() if dr else pd.Timestamp(dhi)
+        tickers = selected_ind.get()[:10]
         return sel_types, k, date_lo, date_hi, tickers
+
 
     @reactive.calc
     @reactive.event(input.ind_go)
     def ind_panel() -> pd.DataFrame:
-        """
-        Build ±k trading-day windows around each selected event *type*,
-        restricted to the chosen tickers.
-
-        Returns tidy columns:
-            ['ticker','event_type','event_date','date','rel_day','logret']
-        """
         sel_types, k, date_lo, date_hi, tickers = _ind_params()
+        return _ind_es_query_panel(sel_types, k, date_lo, date_hi, tickers)
 
-        # 1) Filter EVENTS by user selections
-        ev = EVENTS.copy()
-        mask = ev["date"].between(date_lo, date_hi)
 
-        if sel_types:
-            mask &= ev["event_type"].isin(sel_types)
-
-        if tickers:
-            mask &= ev["ticker"].isin(tickers)
-
-        ev = (
-            ev.loc[mask, ["ticker", "date", "event_type"]]
-              .rename(columns={"date": "event_date"})
-        )
-        if ev.empty:
-            return pd.DataFrame()
-
-        # 2) Map each (ticker, event_date) to its trading-day index (event_tidx)
-        idx_map = (
-            AE.loc[:, ["ticker", "date", "tidx"]]
-              .rename(columns={"date": "event_date", "tidx": "event_tidx"})
-        )
-        ev = (
-            ev.merge(idx_map, on=["ticker", "event_date"], how="left")
-              .dropna(subset=["event_tidx"])
-        )
-        if ev.empty:
-            return pd.DataFrame()
-
-        # 3) Cross-join with offsets −k..+k
-        offsets = pd.DataFrame({"rel_day": np.arange(-k, k + 1, dtype=np.int16)})
-        evx = ev.merge(offsets, how="cross")
-        evx["tidx"] = evx["event_tidx"] + evx["rel_day"]
-
-        # 4) Join back to AE to fetch actual date & log returns
-        base = AE.loc[:, ["ticker", "tidx", "date", "logret"]]
-        out = (
-            evx.merge(base, on=["ticker", "tidx"], how="left")
-               .dropna(subset=["date"])
-               .sort_values(["ticker", "event_date", "date"])
-               .loc[:, ["ticker", "event_type", "event_date", "date", "rel_day", "logret"]]
-        )
-        return out
-    
     @output
     @render.text
     @reactive.event(input.ind_go)
     def ind_summary():
-        """Human-friendly summary for the Individual Stocks study"""
         df = ind_panel()
         if df.empty:
             return "No events found for the selected tickers / settings."
@@ -1762,33 +2104,26 @@ def server(input, output, session):
             f"Events matched: {n_ev} | Rows in ±k: {len(df):,} • "
             f"Min/Max rows per rel_day: {int(by_rel.min())}/{int(by_rel.max())}"
         )
-    
+
+
     @output
     @render.table
     @reactive.event(input.ind_go)
     def ind_tbl():
-        """
-        Aggregate stats by relative day (across selected tickers):
-        mean / median / count of log returns.
-        """
         df = ind_panel()
         if df.empty:
             return pd.DataFrame()
-
         return (
             df.groupby("rel_day")["logret"]
               .agg(mean="mean", median="median", count="count")
               .reset_index()
         )
-    
+
+
     @output
     @render_widget
     @reactive.event(input.ind_go)
     def ind_car_plot():
-        """
-        Interactive Average CAR (cumulative mean log return across events
-        for the selected tickers) with a ±95% CI ribbon.
-        """
         df = ind_panel()
         fig = go.Figure()
 
@@ -1801,47 +2136,42 @@ def server(input, output, session):
             fig.update_layout(template="plotly_white")
             return fig
 
-        g  = df.groupby("rel_day")["logret"]
-        mu = g.mean().sort_index()                                # mean per rel_day
-        n  = g.count().sort_index()                               # sample size
-        se = g.std(ddof=1).sort_index() / np.sqrt(n.clip(lower=1))  # standard error
+        g = df.groupby("rel_day")["logret"]
+        mu = g.mean().sort_index()
+        n  = g.count().sort_index()
+        sd = g.std(ddof=1).sort_index()
 
-        car    = mu.cumsum()                 # cumulative mean
-        car_lo = (mu - 1.96 * se).cumsum()   # lower CI
-        car_hi = (mu + 1.96 * se).cumsum()   # upper CI
-        xvals  = car.index.values
+        # standard error of mean per rel_day
+        se = (sd / np.sqrt(n.clip(lower=1))).fillna(0.0)
 
+        # CAR is cumulative sum of mean abnormal log returns
+        car = mu.cumsum()
 
-        # after you compute mu, n, se, car, car_lo, car_hi
+        # Propagate uncertainty across days (simple independence assumption)
+        car_se = np.sqrt((se ** 2).cumsum())
+        car_lo = car - 1.96 * car_se
+        car_hi = car + 1.96 * car_se
+
         xvals = car.index.astype(int)
 
-        fig = go.Figure()
+        ci_rgba = "rgba(31, 119, 180, 0.20)"
 
-        # CI ribbon: add upper, then lower with fill='tonexty'
-        # CI ribbon
-        ci_rgba = "rgba(31, 119, 180, 0.20)"   # 20% opacity; tweak last number (0–1)
-
-        # upper bound (no visible line)
         fig.add_trace(go.Scatter(
             x=xvals, y=car_hi.values,
             line=dict(width=0, color="rgba(0,0,0,0)"),
-            hoverinfo="skip", showlegend=False, name="CI hi"
+            hoverinfo="skip", showlegend=False
         ))
-
-        # lower bound + fill to previous
         fig.add_trace(go.Scatter(
             x=xvals, y=car_lo.values,
             fill="tonexty",
-            fillcolor=ci_rgba,                  # <<< controls ribbon opacity
+            fillcolor=ci_rgba,
             line=dict(width=0, color="rgba(0,0,0,0)"),
             name="95% CI", showlegend=True, hoverinfo="skip"
         ))
-
-        # main CAR line (with % shown in hover via customdata)
         fig.add_trace(go.Scatter(
             x=xvals, y=car.values, mode="lines", name="Avg CAR",
-            customdata=np.expm1(car.values),  # ≈ percent return
-            meta=n.values,                    # sample size at each rel_day
+            customdata=np.expm1(car.values),
+            meta=n.values,
             hovertemplate=(
                 "Day %{x}<br>"
                 "CAR (log): %{y:.4f}<br>"
@@ -1850,58 +2180,63 @@ def server(input, output, session):
             )
         ))
 
-        # Event-day vertical line
         fig.add_vline(x=0, line_dash="dash", line_color="black", opacity=0.6)
 
         fig.update_layout(
             title="Average Cumulative Abnormal Log Return (±95% CI)",
             xaxis_title="Relative day",
             yaxis_title="Avg CAR (selected tickers)",
-            title_x = 0.5,
+            title_x=0.5,
             template="plotly_white",
             hovermode="x",
             margin=dict(t=60, r=20, b=40, l=60),
             legend=dict(itemsizing="constant"),
         )
         return fig
-    
+
+
     @output
     @render.download(filename=lambda: "individual_event_windows.csv")
     @reactive.event(input.ind_go)
     def ind_dl():
-        """
-        Download the raw (ticker, event_type, event_date, date, rel_day, logret)
-        panel for the Individual Stocks study as CSV.
-        """
         df = ind_panel()
         if df.empty:
             yield b""
             return
         yield df.to_csv(index=False).encode()
 
+
+
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Appendix tables (cache CSV reads)
+    # ─────────────────────────────────────────────────────────────────────────
+
     @output
     @render.data_frame
     def sec_desc_tbl():
-        df = pd.read_csv(SEC_CSV)
         return render.DataTable(
-            df,
-            filters=True,       # column filters
+            SEC_DESC_DF,
+            filters=True,
             selection_mode="row",
-            height="80vh",     # scroll if tall
-            width="100%"
+            height="80vh",
+            width="100%",
         )
-    
+
     @output
     @render.data_frame
     def etfs_tbl():
-        df = pd.read_csv(ETF_CSV)
         return render.DataTable(
-            df,
-            filters=True,       # column filters
+            ETF_DF,
+            filters=True,
             selection_mode="row",
-            height="80vh",     # scroll if tall
-            width="100%"
+            height="80vh",
+            width="100%",
         )
+
+
+
+
 
 # Bundle UI + server into a Shiny app
 app = App(app_ui, server, static_assets=www_dir)

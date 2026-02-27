@@ -5,3 +5,4 @@ pyarrow==22.0.0
 Jinja2>=3.1.2
 plotly>=5.20,<6
 shinywidgets>=0.3
+duckdb>=1.0.0

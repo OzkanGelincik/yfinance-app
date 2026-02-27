@@ -1,4 +1,36 @@
-# --- app data (exclude) ---
+# --- app data / static assets (exclude in all app folders) ---
+**/outputs/
+**/www/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+.env
+.python-version
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Build/test caches
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+# Deployment metadata
+rsconnect-python/# --- app data (exclude) ---
 outputs/
 www/
 
@@ -28,3 +60,9 @@ build/
 .mypy_cache/
 .ruff_cache/
 .coverage
+.env
+
+# local dev / QA helper scripts
+pro_app/ddb_s3_read_check.py
+pro_app/sanity_check_1.py
+pro_app/sanity_check_tidx.py
