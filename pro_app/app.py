@@ -90,9 +90,10 @@ except Exception:
 # ║  DuckDB + S3 hookup                                                      ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
+
 S3_URI = os.getenv(
     "AE_S3_URI",
-    "s3://yfinance-app-data/yfinance-app/analysis_enriched_backfilled_v7_3y_11col_tidx_year.parquet",
+    "https://yfinance-app-data.s3.us-east-1.amazonaws.com/yfinance-app/analysis_enriched_backfilled_v7_3y_11col_tidx_year.parquet",
 )
 
 def _configure_duckdb_s3(con: duckdb.DuckDBPyConnection) -> None:
