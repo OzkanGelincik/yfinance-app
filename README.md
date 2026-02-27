@@ -7,8 +7,8 @@
 
 This repository now contains **two versions** of the app:
 
-- **`legacy_app/`**: the original **pandas-based** Shiny app 🧱
-- **`pro_app/`**: the upgraded **DuckDB + S3-powered** Shiny app 🚀
+- **`legacy_app/`**: the original **pandas-based** Shiny app 🧱 [Try the legacy app now!](https://ozkangelincikshinyapp.shinyapps.io/yfinance-app1/)
+- **`pro_app/`**: the upgraded **DuckDB + S3-powered** Shiny app 🚀 [Try the pro app now!](https://ozkangelincikshinyapp.shinyapps.io/yfinance-app-pro/)
 
 ---
 
